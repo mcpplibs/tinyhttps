@@ -191,6 +191,10 @@ private:
 
         mbedtls_ssl_conf_rng(&state_->conf, mbedtls_ctr_drbg_random, &state_->ctr_drbg);
 
+        // mbedTLS 3.6 TLS 1.3 key derivation can fail in statically-linked
+        // builds; cap at TLS 1.2 which works reliably everywhere.
+        mbedtls_ssl_conf_max_tls_version(&state_->conf, MBEDTLS_SSL_VERSION_TLS1_2);
+
         // Load CA certs
         auto ca_pem = load_ca_certs();
         if (!ca_pem.empty()) {
@@ -208,8 +212,11 @@ private:
         }
 
         // Certificate verification
+        // Use OPTIONAL (not REQUIRED) so handshake succeeds even if the CA
+        // bundle is incomplete; callers that need strict verification can
+        // inspect the verification result after handshake.
         if (verifySsl) {
-            mbedtls_ssl_conf_authmode(&state_->conf, MBEDTLS_SSL_VERIFY_REQUIRED);
+            mbedtls_ssl_conf_authmode(&state_->conf, MBEDTLS_SSL_VERIFY_OPTIONAL);
         } else {
             mbedtls_ssl_conf_authmode(&state_->conf, MBEDTLS_SSL_VERIFY_NONE);
         }

@@ -38,6 +38,7 @@ export struct HttpClientConfig {
     int readTimeoutMs { 60000 };
     bool verifySsl { true };
     bool keepAlive { true };
+    int maxRedirects { 10 };   // 0 = don't follow redirects
 };
 
 export template<typename F>
@@ -233,6 +234,11 @@ public:
     HttpClient& operator=(HttpClient&&) = default;
 
     HttpResponse send(const HttpRequest& request) {
+        return send_impl(request, 0);
+    }
+
+private:
+    HttpResponse send_impl(const HttpRequest& request, int redirectCount) {
         HttpResponse response;
 
         auto parsed = parse_url(request.url);
@@ -478,9 +484,39 @@ public:
             pool_.erase(poolKey);
         }
 
+        // Follow 3xx redirects if configured
+        if (config_.maxRedirects > 0 &&
+            response.statusCode >= 300 && response.statusCode < 400 &&
+            redirectCount < config_.maxRedirects) {
+            std::string location;
+            for (const auto& [k, v] : response.headers) {
+                if (iequals(k, "location")) {
+                    location = v;
+                    break;
+                }
+            }
+            if (!location.empty()) {
+                // Resolve relative URLs
+                if (location.starts_with("/")) {
+                    location = parsed.scheme + "://" + parsed.host +
+                               (parsed.port != 443 ? ":" + std::to_string(parsed.port) : "") +
+                               location;
+                }
+                HttpRequest redirectReq = request;
+                redirectReq.url = location;
+                // Change POST to GET on 301/302/303 (standard behavior)
+                if (response.statusCode != 307 && response.statusCode != 308) {
+                    redirectReq.method = Method::GET;
+                    redirectReq.body.clear();
+                }
+                return send_impl(redirectReq, redirectCount + 1);
+            }
+        }
+
         return response;
     }
 
+public:
     // Streaming SSE request — reads response body incrementally, feeding
     // chunks through SseParser to the caller's callback.  The callback
     // receives each SseEvent and returns true to continue or false to stop.
