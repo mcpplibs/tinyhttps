@@ -762,12 +762,15 @@ public:
 
     // Download URL to file with streaming progress.
     // Follows redirects. Calls onProgress periodically during body read.
+    // isCancelled is checked after each block — return true to abort.
     DownloadToFileResult download_to_file(
         const std::string& url,
         const std::filesystem::path& destFile,
-        DownloadProgressFn onProgress = nullptr)
+        DownloadProgressFn onProgress = nullptr,
+        std::function<bool()> isCancelled = nullptr)
     {
-        return download_to_file_impl(url, destFile, std::move(onProgress), 0);
+        return download_to_file_impl(url, destFile, std::move(onProgress),
+                                     std::move(isCancelled), 0);
     }
 
     HttpClientConfig& config() { return config_; }
@@ -778,6 +781,7 @@ private:
         const std::string& url,
         const std::filesystem::path& destFile,
         DownloadProgressFn onProgress,
+        std::function<bool()> isCancelled,
         int redirectCount)
     {
         DownloadToFileResult result;
@@ -907,7 +911,7 @@ private:
                            location;
             }
             return download_to_file_impl(location, destFile, std::move(onProgress),
-                                         redirectCount + 1);
+                                         std::move(isCancelled), redirectCount + 1);
         }
 
         if (result.statusCode < 200 || result.statusCode >= 300) {
@@ -929,9 +933,23 @@ private:
         std::int64_t totalBytes = contentLength > 0 ? contentLength : 0;
         std::int64_t downloaded = 0;
 
+        // Check cancellation between blocks
+        auto cancelled = [&]() -> bool {
+            if (isCancelled && isCancelled()) {
+                result.error = "cancelled";
+                ofs.close();
+                result.bytesWritten = downloaded;
+                sock->close();
+                pool_.erase(poolKey);
+                return true;
+            }
+            return false;
+        };
+
         // Read body and stream to file
         if (chunked) {
             while (true) {
+                if (cancelled()) return result;
                 std::string sizeLine = read_line(*sock, config_.readTimeoutMs);
                 auto semi = sizeLine.find(';');
                 if (semi != std::string::npos) sizeLine = sizeLine.substr(0, semi);
@@ -944,10 +962,10 @@ private:
                     break;
                 }
 
-                // Read chunk in sub-blocks for progress
                 int remaining = chunkSize;
                 char buf[8192];
                 while (remaining > 0) {
+                    if (cancelled()) return result;
                     int toRead = remaining > static_cast<int>(sizeof(buf))
                                ? static_cast<int>(sizeof(buf)) : remaining;
                     if (!read_exact(*sock, buf, toRead, config_.readTimeoutMs)) {
@@ -961,12 +979,13 @@ private:
                     remaining -= toRead;
                     if (onProgress) onProgress(totalBytes, downloaded);
                 }
-                read_line(*sock, config_.readTimeoutMs); // trailing \r\n
+                read_line(*sock, config_.readTimeoutMs);
             }
         } else if (contentLength > 0) {
             char buf[8192];
             std::int64_t remaining = contentLength;
             while (remaining > 0) {
+                if (cancelled()) return result;
                 int toRead = remaining > static_cast<std::int64_t>(sizeof(buf))
                            ? static_cast<int>(sizeof(buf))
                            : static_cast<int>(remaining);
@@ -982,10 +1001,10 @@ private:
                 if (onProgress) onProgress(totalBytes, downloaded);
             }
         } else {
-            // Read until connection close
             connectionClose = true;
             char buf[8192];
             while (true) {
+                if (cancelled()) return result;
                 if (!sock->wait_readable(config_.readTimeoutMs)) break;
                 int ret = sock->read(buf, sizeof(buf));
                 if (ret <= 0) break;
