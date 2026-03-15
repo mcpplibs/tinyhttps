@@ -41,6 +41,17 @@ export struct HttpClientConfig {
     int maxRedirects { 10 };   // 0 = don't follow redirects
 };
 
+// Progress callback for streaming downloads: (totalBytes, downloadedBytes)
+// totalBytes is 0 when Content-Length is unknown (chunked/connection-close).
+export using DownloadProgressFn = std::function<void(std::int64_t total, std::int64_t downloaded)>;
+
+export struct DownloadToFileResult {
+    int statusCode { 0 };
+    std::string error;
+    std::int64_t bytesWritten { 0 };
+    bool ok() const { return statusCode >= 200 && statusCode < 300 && error.empty(); }
+};
+
 export template<typename F>
 concept SseCallback = std::invocable<F, const SseEvent&> &&
                       std::same_as<std::invoke_result_t<F, const SseEvent&>, bool>;
@@ -749,10 +760,252 @@ public:
         return response;
     }
 
+    // Download URL to file with streaming progress.
+    // Follows redirects. Calls onProgress periodically during body read.
+    DownloadToFileResult download_to_file(
+        const std::string& url,
+        const std::filesystem::path& destFile,
+        DownloadProgressFn onProgress = nullptr)
+    {
+        return download_to_file_impl(url, destFile, std::move(onProgress), 0);
+    }
+
     HttpClientConfig& config() { return config_; }
     const HttpClientConfig& config() const { return config_; }
 
 private:
+    DownloadToFileResult download_to_file_impl(
+        const std::string& url,
+        const std::filesystem::path& destFile,
+        DownloadProgressFn onProgress,
+        int redirectCount)
+    {
+        DownloadToFileResult result;
+
+        auto parsed = parse_url(url);
+        if (parsed.scheme != "https") {
+            result.error = "Only HTTPS is supported";
+            return result;
+        }
+
+        std::string poolKey = parsed.host + ":" + std::to_string(parsed.port);
+
+        // Get or create connection
+        TlsSocket* sock = nullptr;
+        auto it = pool_.find(poolKey);
+        if (it != pool_.end() && it->second.is_valid()) {
+            sock = &it->second;
+        } else {
+            if (it != pool_.end()) pool_.erase(it);
+            auto [insertIt, ok] = pool_.emplace(poolKey, TlsSocket{});
+            sock = &insertIt->second;
+            bool connected = false;
+            if (config_.proxy.has_value()) {
+                auto proxyConf = parse_proxy_url(config_.proxy.value());
+                auto tunnel = proxy_connect(proxyConf.host, proxyConf.port,
+                                           parsed.host, parsed.port,
+                                           config_.connectTimeoutMs);
+                if (tunnel.is_valid()) {
+                    connected = sock->connect_over(std::move(tunnel),
+                                                   parsed.host.c_str(),
+                                                   config_.verifySsl);
+                }
+            } else {
+                connected = sock->connect(parsed.host.c_str(), parsed.port,
+                                         config_.connectTimeoutMs, config_.verifySsl);
+            }
+            if (!connected) {
+                pool_.erase(poolKey);
+                result.error = "Connection failed";
+                return result;
+            }
+        }
+
+        // Build GET request
+        std::string reqStr = "GET ";
+        reqStr += parsed.path;
+        reqStr += " HTTP/1.1\r\nHost: ";
+        reqStr += parsed.host;
+        if (parsed.port != 443) {
+            reqStr += ":";
+            reqStr += std::to_string(parsed.port);
+        }
+        reqStr += "\r\nUser-Agent: tinyhttps/1.0\r\nAccept: */*\r\n";
+        reqStr += config_.keepAlive ? "Connection: keep-alive\r\n" : "Connection: close\r\n";
+        reqStr += "\r\n";
+
+        if (!write_all(*sock, reqStr)) {
+            pool_.erase(poolKey);
+            result.error = "Write failed";
+            return result;
+        }
+
+        // Read status line
+        std::string statusLine = read_line(*sock, config_.readTimeoutMs);
+        if (statusLine.empty()) {
+            pool_.erase(poolKey);
+            result.error = "No response";
+            return result;
+        }
+
+        // Parse status code
+        {
+            auto sp = statusLine.find(' ');
+            if (sp != std::string::npos) {
+                auto rest = std::string_view(statusLine).substr(sp + 1);
+                for (char c : rest) {
+                    if (c >= '0' && c <= '9')
+                        result.statusCode = result.statusCode * 10 + (c - '0');
+                    else break;
+                }
+            }
+        }
+
+        // Read headers
+        bool chunked = false;
+        std::int64_t contentLength = -1;
+        bool connectionClose = false;
+        std::string location;
+
+        while (true) {
+            std::string line = read_line(*sock, config_.readTimeoutMs);
+            if (line.empty()) break;
+            auto colon = line.find(':');
+            if (colon == std::string::npos) continue;
+            std::string key = line.substr(0, colon);
+            std::string_view val = std::string_view(line).substr(colon + 1);
+            while (!val.empty() && val[0] == ' ') val = val.substr(1);
+            std::string valStr(val);
+
+            if (iequals(key, "Transfer-Encoding") && iequals(valStr, "chunked"))
+                chunked = true;
+            if (iequals(key, "Content-Length")) {
+                contentLength = 0;
+                for (char c : valStr) {
+                    if (c >= '0' && c <= '9')
+                        contentLength = contentLength * 10 + (c - '0');
+                }
+            }
+            if (iequals(key, "Connection") && iequals(valStr, "close"))
+                connectionClose = true;
+            if (iequals(key, "Location"))
+                location = valStr;
+        }
+
+        // Follow redirects
+        if (result.statusCode >= 300 && result.statusCode < 400 &&
+            !location.empty() && redirectCount < config_.maxRedirects) {
+            // Drain any body to keep connection clean
+            if (connectionClose) {
+                sock->close();
+                pool_.erase(poolKey);
+            }
+            // Resolve relative URL
+            if (location.starts_with("/")) {
+                location = parsed.scheme + "://" + parsed.host +
+                           (parsed.port != 443 ? ":" + std::to_string(parsed.port) : "") +
+                           location;
+            }
+            return download_to_file_impl(location, destFile, std::move(onProgress),
+                                         redirectCount + 1);
+        }
+
+        if (result.statusCode < 200 || result.statusCode >= 300) {
+            result.error = "HTTP " + std::to_string(result.statusCode);
+            if (connectionClose) { sock->close(); pool_.erase(poolKey); }
+            return result;
+        }
+
+        // Open output file
+        std::error_code ec;
+        std::filesystem::create_directories(destFile.parent_path(), ec);
+        std::ofstream ofs(destFile, std::ios::binary);
+        if (!ofs) {
+            result.error = "Cannot open file: " + destFile.string();
+            if (connectionClose) { sock->close(); pool_.erase(poolKey); }
+            return result;
+        }
+
+        std::int64_t totalBytes = contentLength > 0 ? contentLength : 0;
+        std::int64_t downloaded = 0;
+
+        // Read body and stream to file
+        if (chunked) {
+            while (true) {
+                std::string sizeLine = read_line(*sock, config_.readTimeoutMs);
+                auto semi = sizeLine.find(';');
+                if (semi != std::string::npos) sizeLine = sizeLine.substr(0, semi);
+                while (!sizeLine.empty() && (sizeLine.back() == ' ' || sizeLine.back() == '\t'))
+                    sizeLine.pop_back();
+
+                int chunkSize = parse_hex(sizeLine);
+                if (chunkSize == 0) {
+                    read_line(*sock, config_.readTimeoutMs);
+                    break;
+                }
+
+                // Read chunk in sub-blocks for progress
+                int remaining = chunkSize;
+                char buf[8192];
+                while (remaining > 0) {
+                    int toRead = remaining > static_cast<int>(sizeof(buf))
+                               ? static_cast<int>(sizeof(buf)) : remaining;
+                    if (!read_exact(*sock, buf, toRead, config_.readTimeoutMs)) {
+                        result.error = "Read error during chunked transfer";
+                        ofs.close();
+                        result.bytesWritten = downloaded;
+                        return result;
+                    }
+                    ofs.write(buf, toRead);
+                    downloaded += toRead;
+                    remaining -= toRead;
+                    if (onProgress) onProgress(totalBytes, downloaded);
+                }
+                read_line(*sock, config_.readTimeoutMs); // trailing \r\n
+            }
+        } else if (contentLength > 0) {
+            char buf[8192];
+            std::int64_t remaining = contentLength;
+            while (remaining > 0) {
+                int toRead = remaining > static_cast<std::int64_t>(sizeof(buf))
+                           ? static_cast<int>(sizeof(buf))
+                           : static_cast<int>(remaining);
+                if (!read_exact(*sock, buf, toRead, config_.readTimeoutMs)) {
+                    result.error = "Read error";
+                    ofs.close();
+                    result.bytesWritten = downloaded;
+                    return result;
+                }
+                ofs.write(buf, toRead);
+                downloaded += toRead;
+                remaining -= toRead;
+                if (onProgress) onProgress(totalBytes, downloaded);
+            }
+        } else {
+            // Read until connection close
+            connectionClose = true;
+            char buf[8192];
+            while (true) {
+                if (!sock->wait_readable(config_.readTimeoutMs)) break;
+                int ret = sock->read(buf, sizeof(buf));
+                if (ret <= 0) break;
+                ofs.write(buf, ret);
+                downloaded += ret;
+                if (onProgress) onProgress(totalBytes, downloaded);
+            }
+        }
+
+        ofs.close();
+        result.bytesWritten = downloaded;
+
+        if (connectionClose) {
+            sock->close();
+            pool_.erase(poolKey);
+        }
+
+        return result;
+    }
+
     HttpClientConfig config_;
     std::map<std::string, TlsSocket> pool_;
 };
