@@ -13,7 +13,7 @@ jobs:
       - uses: actions/checkout@v4
 
       # Bootstrap xlings — the tool that the workspace's `.xlings.json`
-      # binds tool versions to (here it pins mcpp 0.0.3).
+      # binds tool versions to (here it pins mcpp 0.0.4).
       - name: Install xlings
         env:
           XLINGS_VERSION: 0.4.25
@@ -32,13 +32,13 @@ jobs:
 
       # Cache mcpp's self-bootstrapped sandbox: musl-gcc + binutils +
       # glibc + ninja + patchelf, plus the cloned mcpp-index. ~800 MB
-      # one-time download — reused across runs since mcpp 0.0.3's
+      # one-time download — reused across runs since mcpp 0.0.4's
       # toolchain set is version-pinned.
       - name: Cache mcpp sandbox
         uses: actions/cache@v4
         with:
-          path: ~/.xlings/data/xpkgs/xim-x-mcpp/0.0.3/registry
-          key: mcpp-sandbox-${{ runner.os }}-mcpp0.0.3
+          path: ~/.xlings/data/xpkgs/xim-x-mcpp/0.0.4/registry
+          key: mcpp-sandbox-${{ runner.os }}-mcpp0.0.4
 
       - name: Build with mcpp
         run: mcpp build
