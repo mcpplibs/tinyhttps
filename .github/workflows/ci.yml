@@ -1,0 +1,37 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+jobs:
+  build:
+    name: build + test (linux x86_64, mcpp)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Bootstrap xlings — the tool that the workspace's `.xlings.json`
+      # binds tool versions to (here it pins mcpp 0.0.3).
+      - name: Install xlings
+        env:
+          XLINGS_VERSION: 0.4.25
+        run: |
+          tarball="xlings-${XLINGS_VERSION}-linux-x86_64.tar.gz"
+          curl -fsSL -o "/tmp/${tarball}" \
+            "https://github.com/d2learn/xlings/releases/download/v${XLINGS_VERSION}/${tarball}"
+          tar -xzf "/tmp/${tarball}" -C /tmp
+          "/tmp/xlings-${XLINGS_VERSION}-linux-x86_64/subos/default/bin/xlings" self install
+          echo "$HOME/.xlings/subos/current/bin" >> "$GITHUB_PATH"
+
+      # Resolves `.xlings.json` → installs mcpp@0.0.3 (and any other
+      # workspace tools listed). Idempotent on cache hits.
+      - name: Install workspace tools (.xlings.json)
+        run: xlings install -y
+
+      - name: Build with mcpp
+        run: mcpp build
+
+      - name: Run tests
+        run: mcpp test
