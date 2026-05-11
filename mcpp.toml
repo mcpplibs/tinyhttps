@@ -1,5 +1,6 @@
 [package]
-name        = "mcpplibs.tinyhttps"
+namespace   = "mcpplibs"
+name        = "tinyhttps"
 version     = "0.2.2"
 description = "Minimal C++23 HTTP/HTTPS client with SSE streaming support"
 license     = "Apache-2.0"
@@ -11,9 +12,9 @@ kind = "lib"
 # mbedtls is the only runtime dep. mcpp 0.0.3's transitive walker pulls
 # its headers + libmbedtls.a into anything that imports tinyhttps, so
 # downstream projects (e.g. mcpplibs.llmapi) don't need to repeat it.
-[dependencies]
+[dependencies.compat]
 mbedtls = "3.6.1"
 
 # `mcpp test` resolves these and discovers tests/**/*.cpp automatically.
-[dev-dependencies]
+[dev-dependencies.compat]
 gtest = "1.15.2"
