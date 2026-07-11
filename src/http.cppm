@@ -49,6 +49,10 @@ export struct DownloadToFileResult {
     int statusCode { 0 };
     std::string error;
     std::int64_t bytesWritten { 0 };
+    std::optional<std::int64_t> expectedBytes;
+    std::string finalUrl;
+    std::string etag;
+    std::string lastModified;
     bool ok() const { return statusCode >= 200 && statusCode < 300 && error.empty(); }
 };
 
@@ -186,6 +190,28 @@ static std::string read_line(TlsSocket& sock, int timeoutMs) {
     return line;
 }
 
+static std::expected<std::string, std::string>
+read_complete_line(TlsSocket& sock, int timeoutMs) {
+    std::string line;
+    char c {};
+    while (true) {
+        if (!sock.wait_readable(timeoutMs)) {
+            return std::unexpected("timeout or EOF before CRLF");
+        }
+        int ret = sock.read(&c, 1);
+        if (ret <= 0) {
+            return std::unexpected("EOF before CRLF");
+        }
+        line += c;
+        if (line.size() >= 2
+            && line[line.size() - 2] == '\r'
+            && line[line.size() - 1] == '\n') {
+            line.resize(line.size() - 2);
+            return line;
+        }
+    }
+}
+
 // Write all data to socket
 static bool write_all(TlsSocket& sock, const std::string& data) {
     int total = 0;
@@ -214,6 +240,20 @@ static int parse_hex(std::string_view s) {
         else break;
     }
     return result;
+}
+
+export std::optional<std::int64_t>
+parse_chunk_size_line(std::string_view line) {
+    if (line.empty()) return std::nullopt;
+    std::uint64_t value {};
+    auto [end, error] = std::from_chars(
+        line.data(), line.data() + line.size(), value, 16);
+    if (error != std::errc{} || end != line.data() + line.size()
+        || value > static_cast<std::uint64_t>(
+            std::numeric_limits<int>::max())) {
+        return std::nullopt;
+    }
+    return static_cast<std::int64_t>(value);
 }
 
 // Case-insensitive string comparison
@@ -870,6 +910,8 @@ private:
         std::int64_t contentLength = -1;
         bool connectionClose = false;
         std::string location;
+        std::string etag;
+        std::string lastModified;
 
         while (true) {
             std::string line = read_line(*sock, config_.readTimeoutMs);
@@ -894,6 +936,10 @@ private:
                 connectionClose = true;
             if (iequals(key, "Location"))
                 location = valStr;
+            if (iequals(key, "ETag"))
+                etag = valStr;
+            if (iequals(key, "Last-Modified"))
+                lastModified = valStr;
         }
 
         // Follow redirects
@@ -919,6 +965,11 @@ private:
             if (connectionClose) { sock->close(); pool_.erase(poolKey); }
             return result;
         }
+
+        result.finalUrl = url;
+        result.etag = std::move(etag);
+        result.lastModified = std::move(lastModified);
+        if (contentLength >= 0) result.expectedBytes = contentLength;
 
         // Open output file
         std::error_code ec;
@@ -950,15 +1001,45 @@ private:
         if (chunked) {
             while (true) {
                 if (cancelled()) return result;
-                std::string sizeLine = read_line(*sock, config_.readTimeoutMs);
+                auto sizeResult = read_complete_line(
+                    *sock, config_.readTimeoutMs);
+                if (!sizeResult) {
+                    result.error = "Invalid chunk size line: "
+                        + std::move(sizeResult).error();
+                    result.bytesWritten = downloaded;
+                    sock->close();
+                    pool_.erase(poolKey);
+                    return result;
+                }
+                std::string sizeLine = std::move(*sizeResult);
                 auto semi = sizeLine.find(';');
                 if (semi != std::string::npos) sizeLine = sizeLine.substr(0, semi);
                 while (!sizeLine.empty() && (sizeLine.back() == ' ' || sizeLine.back() == '\t'))
                     sizeLine.pop_back();
 
-                int chunkSize = parse_hex(sizeLine);
+                auto parsedChunkSize = parse_chunk_size_line(sizeLine);
+                if (!parsedChunkSize) {
+                    result.error = "Invalid chunk size: " + sizeLine;
+                    result.bytesWritten = downloaded;
+                    sock->close();
+                    pool_.erase(poolKey);
+                    return result;
+                }
+                int chunkSize = static_cast<int>(*parsedChunkSize);
                 if (chunkSize == 0) {
-                    read_line(*sock, config_.readTimeoutMs);
+                    for (;;) {
+                        auto trailer = read_complete_line(
+                            *sock, config_.readTimeoutMs);
+                        if (!trailer) {
+                            result.error = "Invalid chunk trailer: "
+                                + std::move(trailer).error();
+                            result.bytesWritten = downloaded;
+                            sock->close();
+                            pool_.erase(poolKey);
+                            return result;
+                        }
+                        if (trailer->empty()) break;
+                    }
                     break;
                 }
 
@@ -979,7 +1060,15 @@ private:
                     remaining -= toRead;
                     if (onProgress) onProgress(totalBytes, downloaded);
                 }
-                read_line(*sock, config_.readTimeoutMs);
+                auto delimiter = read_complete_line(
+                    *sock, config_.readTimeoutMs);
+                if (!delimiter || !delimiter->empty()) {
+                    result.error = "Missing CRLF after chunk data";
+                    result.bytesWritten = downloaded;
+                    sock->close();
+                    pool_.erase(poolKey);
+                    return result;
+                }
             }
         } else if (contentLength > 0) {
             char buf[8192];

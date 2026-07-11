@@ -6,6 +6,36 @@ import std;
 
 namespace https = mcpplibs::tinyhttps;
 
+TEST(ChunkedProtocol, RejectsEmptyInvalidAndOverflowSizeLines) {
+    EXPECT_FALSE(https::parse_chunk_size_line("").has_value());
+    EXPECT_FALSE(https::parse_chunk_size_line("xyz").has_value());
+    EXPECT_FALSE(https::parse_chunk_size_line("1g").has_value());
+    EXPECT_FALSE(https::parse_chunk_size_line("FFFFFFFFFFFFFFFF").has_value());
+}
+
+TEST(ChunkedProtocol, AcceptsValidSizeAndTerminalChunk) {
+    ASSERT_TRUE(https::parse_chunk_size_line("1a").has_value());
+    EXPECT_EQ(*https::parse_chunk_size_line("1a"), 26);
+    ASSERT_TRUE(https::parse_chunk_size_line("0").has_value());
+    EXPECT_EQ(*https::parse_chunk_size_line("0"), 0);
+}
+
+TEST(DownloadResultContract, CarriesTransferAndResponseMetadata) {
+    https::DownloadToFileResult result;
+    result.bytesWritten = 42;
+    result.expectedBytes = 42;
+    result.finalUrl = "https://example.test/final";
+    result.etag = "\"abc\"";
+    result.lastModified = "Wed, 21 Oct 2015 07:28:00 GMT";
+
+    EXPECT_EQ(result.bytesWritten, 42);
+    ASSERT_TRUE(result.expectedBytes.has_value());
+    EXPECT_EQ(*result.expectedBytes, 42);
+    EXPECT_EQ(result.finalUrl, "https://example.test/final");
+    EXPECT_EQ(result.etag, "\"abc\"");
+    EXPECT_FALSE(result.lastModified.empty());
+}
+
 // Test download_to_file against a real HTTPS endpoint.
 // Uses httpbin.org which returns known-size responses.
 
