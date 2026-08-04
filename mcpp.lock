@@ -5,5 +5,5 @@ version = 2
 namespace = "compat"
 version = "3.6.1"
 source  = "index+compat@3.6.1"
-hash    = "fnv1a:83dea67ac1379be3"
+hash    = "fnv1a:bb700e69e973ccd0"
 

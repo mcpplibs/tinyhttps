@@ -39,6 +39,10 @@ export struct HttpClientConfig {
     bool verifySsl { true };
     bool keepAlive { true };
     int maxRedirects { 10 };   // 0 = don't follow redirects
+    // Parallel download controls (aria2-style):
+    int maxConnectionsPerFile { 1 };            // concurrency cap: how many segment workers run at once (1 = sequential)
+    int maxSegments { 0 };                       // max split count (-s). 0 = tie split count to maxConnectionsPerFile (legacy)
+    std::int64_t minSegmentBytes { 1 << 20 };    // minimum bytes per segment (--min-split-size)
 };
 
 // Progress callback for streaming downloads: (totalBytes, downloadedBytes)
@@ -267,6 +271,56 @@ static bool iequals(std::string_view a, std::string_view b) {
         if (ca != cb) return false;
     }
     return true;
+}
+
+// Parse the numeric status code from a status line ("HTTP/1.1 206 Partial Content").
+// Returns 0 on a malformed line.
+static int parse_status_code(std::string_view statusLine) {
+    auto sp = statusLine.find(' ');
+    if (sp == std::string_view::npos) return 0;
+    int code = 0;
+    for (char c : statusLine.substr(sp + 1)) {
+        if (c < '0' || c > '9') break;
+        code = code * 10 + (c - '0');
+    }
+    return code;
+}
+
+// Parse the total size from a Content-Range header, e.g. "bytes 0-0/10485760".
+// Returns nullopt when the total is absent or unknown ("bytes 0-0/*").
+static std::optional<std::int64_t> parse_content_range_total(std::string_view value) {
+    auto slash = value.rfind('/');
+    if (slash == std::string_view::npos) return std::nullopt;
+    std::string_view totalStr = value.substr(slash + 1);
+    if (totalStr == "*") return std::nullopt;
+    std::int64_t total = 0;
+    for (char c : totalStr) {
+        if (c < '0' || c > '9') return std::nullopt;
+        if (total > (std::numeric_limits<std::int64_t>::max() - (c - '0')) / 10) {
+            return std::nullopt;  // overflow
+        }
+        total = total * 10 + (c - '0');
+    }
+    return total;
+}
+
+// Parse the range start from a Content-Range header, e.g. "bytes 1024-2047/4096"
+// yields 1024. Returns nullopt for non-bytes units or a malformed value.
+static std::optional<std::int64_t> parse_content_range_start(std::string_view value) {
+    auto space = value.find(' ');
+    if (space == std::string_view::npos) return std::nullopt;
+    if (!iequals(value.substr(0, space), "bytes")) return std::nullopt;
+    auto dash = value.find('-', space + 1);
+    if (dash == std::string_view::npos) return std::nullopt;
+    std::int64_t start = 0;
+    for (char c : value.substr(space + 1, dash - space - 1)) {
+        if (c < '0' || c > '9') return std::nullopt;
+        if (start > (std::numeric_limits<std::int64_t>::max() - (c - '0')) / 10) {
+            return std::nullopt;  // overflow
+        }
+        start = start * 10 + (c - '0');
+    }
+    return start;
 }
 
 export class HttpClient {
@@ -813,6 +867,23 @@ public:
                                      std::move(isCancelled), 0);
     }
 
+    // Parallel segmented download using HTTP Range (aria2-style). Probes the
+    // server for Range support, then fetches non-overlapping segments into a
+    // pre-allocated file: split count is maxSegments (or ceil(size /
+    // minSegmentBytes)), and concurrency is capped by maxConnectionsPerFile.
+    // Falls back to download_to_file() when the server ignores Range or the
+    // file is too small to shard. Same progress/cancel semantics as
+    // download_to_file().
+    DownloadToFileResult download_to_file_parallel(
+        const std::string& url,
+        const std::filesystem::path& destFile,
+        DownloadProgressFn onProgress = nullptr,
+        std::function<bool()> isCancelled = nullptr)
+    {
+        return download_to_file_parallel_impl(url, destFile, std::move(onProgress),
+                                              std::move(isCancelled), 0);
+    }
+
     HttpClientConfig& config() { return config_; }
     const HttpClientConfig& config() const { return config_; }
 
@@ -1111,6 +1182,504 @@ private:
             pool_.erase(poolKey);
         }
 
+        return result;
+    }
+
+    // Establish a fresh TLS connection to `parsed` (proxy-aware). Leaves `sock`
+    // invalid on failure. Used by parallel segment workers — each worker gets
+    // its own connection and never touches the shared pool_.
+    bool connect_fresh(const ParsedUrl& parsed, TlsSocket& sock) {
+        bool connected = false;
+        if (config_.proxy.has_value()) {
+            auto proxyConf = parse_proxy_url(config_.proxy.value());
+            auto tunnel = proxy_connect(proxyConf.host, proxyConf.port,
+                                       parsed.host, parsed.port,
+                                       config_.connectTimeoutMs);
+            if (tunnel.is_valid()) {
+                connected = sock.connect_over(std::move(tunnel),
+                                              parsed.host.c_str(),
+                                              config_.verifySsl);
+            }
+        } else {
+            connected = sock.connect(parsed.host.c_str(), parsed.port,
+                                     config_.connectTimeoutMs, config_.verifySsl);
+        }
+        return connected;
+    }
+
+    DownloadToFileResult download_to_file_parallel_impl(
+        const std::string& url,
+        const std::filesystem::path& destFile,
+        DownloadProgressFn onProgress,
+        std::function<bool()> isCancelled,
+        int redirectCount)
+    {
+        DownloadToFileResult result;
+
+        // Parallelism disabled — identical behavior to the sequential path.
+        if (config_.maxConnectionsPerFile <= 1) {
+            return download_to_file_impl(url, destFile, std::move(onProgress),
+                                         std::move(isCancelled), redirectCount);
+        }
+
+        auto parsed = parse_url(url);
+        if (parsed.scheme != "https") {
+            result.error = "Only HTTPS is supported";
+            return result;
+        }
+
+        // Probe: can the server honor Range?
+        TlsSocket probeSock;
+        if (!connect_fresh(parsed, probeSock)) {
+            result.error = "Connection failed";
+            return result;
+        }
+
+        std::string probeReq = "GET " + parsed.path + " HTTP/1.1\r\nHost: " + parsed.host;
+        if (parsed.port != 443) probeReq += ":" + std::to_string(parsed.port);
+        probeReq += "\r\nUser-Agent: tinyhttps/1.0\r\nAccept: */*\r\nRange: bytes=0-0\r\nConnection: close\r\n\r\n";
+
+        if (!write_all(probeSock, probeReq)) {
+            result.error = "Write failed";
+            return result;
+        }
+
+        std::string statusLine = read_line(probeSock, config_.readTimeoutMs);
+        if (statusLine.empty()) {
+            result.error = "No response";
+            return result;
+        }
+        int statusCode = parse_status_code(statusLine);
+
+        std::string location;
+        std::string contentRange;
+        std::string etag;
+        std::string lastModified;
+        bool chunked = false;
+        std::int64_t contentLength = -1;
+        while (true) {
+            std::string line = read_line(probeSock, config_.readTimeoutMs);
+            if (line.empty()) break;
+            auto colon = line.find(':');
+            if (colon == std::string::npos) continue;
+            std::string key = line.substr(0, colon);
+            std::string_view val = std::string_view(line).substr(colon + 1);
+            while (!val.empty() && val[0] == ' ') val = val.substr(1);
+            std::string valStr(val);
+            if (iequals(key, "Location")) location = valStr;
+            if (iequals(key, "Content-Range")) contentRange = valStr;
+            if (iequals(key, "ETag")) etag = valStr;
+            if (iequals(key, "Last-Modified")) lastModified = valStr;
+            if (iequals(key, "Transfer-Encoding") && iequals(valStr, "chunked")) chunked = true;
+            if (iequals(key, "Content-Length")) {
+                contentLength = 0;
+                for (char c : valStr) {
+                    if (c >= '0' && c <= '9') contentLength = contentLength * 10 + (c - '0');
+                }
+            }
+        }
+
+        // Follow redirects up front so every segment worker targets the final
+        // URL directly instead of following the chain itself.
+        if (statusCode >= 300 && statusCode < 400 &&
+            !location.empty() && redirectCount < config_.maxRedirects) {
+            probeSock.close();
+            if (location.starts_with("/")) {
+                location = parsed.scheme + "://" + parsed.host +
+                           (parsed.port != 443 ? ":" + std::to_string(parsed.port) : "") +
+                           location;
+            }
+            return download_to_file_parallel_impl(location, destFile,
+                                                  std::move(onProgress),
+                                                  std::move(isCancelled),
+                                                  redirectCount + 1);
+        }
+
+        // 200 — server ignored Range; the probe response body is the whole
+        // file, so write it out directly (no second round-trip).
+        if (statusCode == 200) {
+            std::error_code ec;
+            std::filesystem::create_directories(destFile.parent_path(), ec);
+            std::ofstream ofs(destFile, std::ios::binary);
+            if (!ofs) {
+                result.error = "Cannot open file: " + destFile.string();
+                return result;
+            }
+            std::int64_t written = 0;
+            auto cancelled = [&]() -> bool {
+                if (isCancelled && isCancelled()) {
+                    result.error = "cancelled";
+                    result.bytesWritten = written;
+                    return true;
+                }
+                return false;
+            };
+            if (chunked) {
+                while (true) {
+                    if (cancelled()) return result;
+                    std::string sizeLine = read_line(probeSock, config_.readTimeoutMs);
+                    auto semi = sizeLine.find(';');
+                    if (semi != std::string::npos) sizeLine = sizeLine.substr(0, semi);
+                    while (!sizeLine.empty() && (sizeLine.back() == ' ' || sizeLine.back() == '\t'))
+                        sizeLine.pop_back();
+                    int chunkSize = parse_hex(sizeLine);
+                    if (chunkSize == 0) break;
+                    char buf[8192];
+                    int remaining = chunkSize;
+                    while (remaining > 0) {
+                        if (cancelled()) return result;
+                        int toRead = remaining > static_cast<int>(sizeof(buf))
+                                   ? static_cast<int>(sizeof(buf)) : remaining;
+                        if (!read_exact(probeSock, buf, toRead, config_.readTimeoutMs)) {
+                            result.error = "Read error during fallback download";
+                            result.bytesWritten = written;
+                            return result;
+                        }
+                        ofs.write(buf, toRead);
+                        written += toRead;
+                        remaining -= toRead;
+                        if (onProgress) onProgress(0, written);
+                    }
+                    read_line(probeSock, config_.readTimeoutMs);  // trailing CRLF
+                }
+            } else if (contentLength >= 0) {
+                char buf[8192];
+                std::int64_t remaining = contentLength;
+                while (remaining > 0) {
+                    if (cancelled()) return result;
+                    int toRead = remaining > static_cast<std::int64_t>(sizeof(buf))
+                               ? static_cast<int>(sizeof(buf))
+                               : static_cast<int>(remaining);
+                    if (!read_exact(probeSock, buf, toRead, config_.readTimeoutMs)) {
+                        result.error = "Read error during fallback download";
+                        result.bytesWritten = written;
+                        return result;
+                    }
+                    ofs.write(buf, toRead);
+                    written += toRead;
+                    remaining -= toRead;
+                    if (onProgress) onProgress(contentLength, written);
+                }
+            } else {
+                char buf[8192];
+                while (true) {
+                    if (cancelled()) return result;
+                    if (!probeSock.wait_readable(config_.readTimeoutMs)) break;
+                    int ret = probeSock.read(buf, sizeof(buf));
+                    if (ret <= 0) break;
+                    ofs.write(buf, ret);
+                    written += ret;
+                    if (onProgress) onProgress(0, written);
+                }
+            }
+            ofs.close();
+            result.statusCode = 200;
+            result.finalUrl = url;
+            result.etag = std::move(etag);
+            result.lastModified = std::move(lastModified);
+            if (contentLength >= 0) result.expectedBytes = contentLength;
+            result.bytesWritten = written;
+            return result;
+        }
+
+        probeSock.close();
+
+        // 416 — resource is empty; write a zero-byte file and succeed.
+        if (statusCode == 416) {
+            std::error_code ec;
+            std::filesystem::create_directories(destFile.parent_path(), ec);
+            {
+                std::ofstream ofs(destFile, std::ios::binary);
+                if (!ofs) {
+                    result.error = "Cannot create file: " + destFile.string();
+                    return result;
+                }
+            }
+            result.statusCode = 200;
+            result.finalUrl = url;
+            result.expectedBytes = 0;
+            result.bytesWritten = 0;
+            return result;
+        }
+
+        if (statusCode != 206) {
+            result.error = "HTTP " + std::to_string(statusCode);
+            return result;
+        }
+
+        auto totalOpt = parse_content_range_total(contentRange);
+        if (!totalOpt || *totalOpt == 0) {
+            // Total unknown or empty — sequential path.
+            return download_to_file_impl(url, destFile, std::move(onProgress),
+                                         std::move(isCancelled), redirectCount);
+        }
+        std::int64_t totalBytes = *totalOpt;
+
+        // Segment. Split into ceil(total / minSegmentBytes) pieces, capped by
+        // maxSegments when set; with maxSegments == 0 (legacy default) the
+        // split count is tied to the connection count.
+        constexpr int MAX_SEGMENTS = 2048;  // hard cap against pathological configs
+        std::int64_t minSeg = config_.minSegmentBytes > 0
+                              ? config_.minSegmentBytes : (1 << 20);
+        int nSegs = static_cast<int>((totalBytes + minSeg - 1) / minSeg);
+        if (config_.maxSegments > 0) {
+            nSegs = std::min(nSegs, config_.maxSegments);
+        } else {
+            nSegs = std::min(nSegs, config_.maxConnectionsPerFile);
+        }
+        nSegs = std::min(nSegs, MAX_SEGMENTS);
+        if (nSegs <= 1) {
+            // Too small to split — sequential path.
+            return download_to_file_impl(url, destFile, std::move(onProgress),
+                                         std::move(isCancelled), redirectCount);
+        }
+        const int nWorkers = std::min(config_.maxConnectionsPerFile, nSegs);
+
+        // Pre-allocate the file so each segment can write into place.
+        std::error_code ec;
+        std::filesystem::create_directories(destFile.parent_path(), ec);
+        std::ofstream create(destFile, std::ios::binary);
+        if (!create) {
+            result.error = "Cannot create file: " + destFile.string();
+            return result;
+        }
+        create.close();
+        std::error_code resizeEc;
+        std::filesystem::resize_file(destFile, totalBytes, resizeEc);
+        if (resizeEc) {
+            result.error = "Cannot resize file: " + destFile.string();
+            return result;
+        }
+
+        // Non-overlapping segment boundaries.
+        std::vector<std::pair<std::int64_t, std::int64_t>> segments;
+        segments.reserve(nSegs);
+        std::int64_t segSize = (totalBytes + nSegs - 1) / nSegs;
+        for (int i = 0; i < nSegs; ++i) {
+            std::int64_t s = i * segSize;
+            std::int64_t e = std::min(s + segSize - 1, totalBytes - 1);
+            if (s > e) break;
+            segments.emplace_back(s, e);
+        }
+
+        // Shared worker state.
+        std::atomic<std::int64_t> globalWritten{0};
+        std::atomic<bool> userCancelled{false};
+        std::atomic<bool> anyFailed{false};
+        std::atomic<int> nextSegment{0};
+        std::mutex stateMutex;  // serializes onProgress + firstError
+        std::string firstError;
+        std::int64_t reportedMax = 0;  // guarded by stateMutex: keeps onProgress monotonic
+
+        auto fail = [&](std::string msg) {
+            std::lock_guard<std::mutex> lock(stateMutex);
+            if (firstError.empty()) firstError = std::move(msg);
+            anyFailed.store(true);
+        };
+
+        // Workers pull segments from a shared index until exhausted, so
+        // maxSegments can exceed maxConnectionsPerFile (aria2 -s vs -x).
+        auto worker = [&]() {
+            // Open once per worker; Windows CRT sharing allows concurrent
+            // in-place writes at disjoint offsets.
+            std::fstream file(destFile, std::ios::binary | std::ios::in | std::ios::out);
+            if (!file) {
+                fail("Cannot open file: " + destFile.string());
+                return;
+            }
+
+            constexpr int MAX_RETRIES = 2;
+            const int totalSegs = static_cast<int>(segments.size());
+
+            for (;;) {
+                if (userCancelled.load() || anyFailed.load()) return;
+                const int idx = nextSegment.fetch_add(1);
+                if (idx >= totalSegs) return;  // queue exhausted
+
+                const std::int64_t segStart = segments[idx].first;
+                const std::int64_t segEnd = segments[idx].second;
+                const std::int64_t segLen = segEnd - segStart + 1;
+                std::int64_t segWritten = 0;
+
+                for (int attempt = 0; attempt <= MAX_RETRIES; ++attempt) {
+                    if (userCancelled.load() || anyFailed.load()) return;
+
+                    TlsSocket sock;
+                    if (!connect_fresh(parsed, sock)) {
+                        if (attempt == MAX_RETRIES) {
+                            fail("Connection failed for segment " +
+                                 std::to_string(segStart) + "-" + std::to_string(segEnd));
+                            return;
+                        }
+                        continue;
+                    }
+
+                    // Request only the not-yet-downloaded remainder (natural resume).
+                    std::int64_t chunkStart = segStart + segWritten;
+                    std::string req = "GET " + parsed.path + " HTTP/1.1\r\nHost: " + parsed.host;
+                    if (parsed.port != 443) req += ":" + std::to_string(parsed.port);
+                    req += "\r\nUser-Agent: tinyhttps/1.0\r\nAccept: */*\r\n"
+                           "Range: bytes=" + std::to_string(chunkStart) + "-" +
+                           std::to_string(segEnd) +
+                           "\r\nConnection: close\r\n\r\n";
+
+                    if (!write_all(sock, req)) {
+                        sock.close();
+                        if (attempt == MAX_RETRIES) {
+                            fail("Write failed for segment " + std::to_string(segStart) +
+                                 "-" + std::to_string(segEnd));
+                            return;
+                        }
+                        continue;
+                    }
+
+                    std::string statusLine = read_line(sock, config_.readTimeoutMs);
+                    int statusCode = parse_status_code(statusLine);
+                    if (statusCode != 206) {
+                        // Retry; a persistent non-206 is a segment failure.
+                        sock.close();
+                        if (attempt == MAX_RETRIES) {
+                            fail("Unexpected status " + std::to_string(statusCode) +
+                                 " for segment " + std::to_string(segStart) + "-" +
+                                 std::to_string(segEnd));
+                            return;
+                        }
+                        continue;
+                    }
+
+                    // Read response headers, keeping Content-Range for validation.
+                    bool segChunked = false;
+                    std::string segContentRange;
+                    while (true) {
+                        std::string line = read_line(sock, config_.readTimeoutMs);
+                        if (line.empty()) break;
+                        auto colon = line.find(':');
+                        if (colon == std::string::npos) continue;
+                        std::string key = line.substr(0, colon);
+                        std::string_view val = std::string_view(line).substr(colon + 1);
+                        while (!val.empty() && val[0] == ' ') val = val.substr(1);
+                        std::string valStr(val);
+                        if (iequals(key, "Transfer-Encoding") && iequals(valStr, "chunked"))
+                            segChunked = true;
+                        if (iequals(key, "Content-Range"))
+                            segContentRange = valStr;
+                    }
+
+                    // A chunked 206 would write raw framing bytes into the
+                    // pre-allocated file, and a mismatched Content-Range would
+                    // write the wrong bytes — neither is retryable, so fail.
+                    bool rangeOk = !segChunked;
+                    if (rangeOk && !segContentRange.empty()) {
+                        auto rangeStart = parse_content_range_start(segContentRange);
+                        rangeOk = rangeStart && *rangeStart == chunkStart &&
+                                  parse_content_range_total(segContentRange) == totalBytes;
+                    }
+                    if (!rangeOk) {
+                        sock.close();
+                        fail(segChunked
+                             ? "Chunked 206 response for segment " +
+                               std::to_string(segStart) + "-" + std::to_string(segEnd)
+                             : "Mismatched Content-Range for segment " +
+                               std::to_string(segStart) + "-" + std::to_string(segEnd));
+                        return;
+                    }
+
+                    file.seekp(segStart + segWritten);
+
+                    bool ok = true;
+                    std::int64_t remaining = segLen - segWritten;
+                    char buf[8192];
+                    while (remaining > 0) {
+                        if (userCancelled.load() || anyFailed.load()) {
+                            ok = false;
+                            break;
+                        }
+                        if (isCancelled && isCancelled()) {
+                            userCancelled.store(true);
+                            ok = false;
+                            break;
+                        }
+                        int toRead = remaining > static_cast<std::int64_t>(sizeof(buf))
+                                   ? static_cast<int>(sizeof(buf)) : static_cast<int>(remaining);
+                        if (!read_exact(sock, buf, toRead, config_.readTimeoutMs)) {
+                            ok = false;
+                            break;  // connection dropped — retry the remaining range
+                        }
+                        file.write(buf, toRead);
+                        if (!file) {
+                            ok = false;
+                            break;
+                        }
+                        segWritten += toRead;
+                        remaining -= toRead;
+                        std::int64_t g = globalWritten.fetch_add(toRead) + toRead;
+                        std::lock_guard<std::mutex> lock(stateMutex);
+                        if (onProgress && g > reportedMax) {
+                            reportedMax = g;
+                            onProgress(totalBytes, g);
+                        }
+                    }
+
+                    sock.close();
+                    if (!ok) {
+                        if (userCancelled.load() || anyFailed.load()) return;
+                        if (attempt == MAX_RETRIES) {
+                            fail("Read error for segment " + std::to_string(segStart) +
+                                 "-" + std::to_string(segEnd));
+                            return;
+                        }
+                        continue;  // retry the remainder of this segment
+                    }
+                    break;  // this segment done — grab the next one
+                }
+            }
+        };
+
+        // Exceptions escaping a thread call std::terminate — surface them as
+        // download failures instead (e.g. a throwing onProgress callback).
+        auto workerGuarded = [&]() {
+            try {
+                worker();
+            } catch (const std::exception& e) {
+                fail(std::string("Worker exception: ") + e.what());
+            } catch (...) {
+                fail("Worker exception");
+            }
+        };
+
+        std::vector<std::thread> threads;
+        threads.reserve(nWorkers);
+        for (int i = 0; i < nWorkers; ++i) {
+            threads.emplace_back(workerGuarded);
+        }
+        for (auto& t : threads) t.join();
+
+        if (userCancelled.load()) {
+            result.statusCode = 0;
+            result.error = "cancelled";
+            result.bytesWritten = globalWritten.load();
+            return result;
+        }
+        if (anyFailed.load()) {
+            std::string err;
+            {
+                std::lock_guard<std::mutex> lock(stateMutex);
+                err = firstError;
+            }
+            std::error_code rmEc;
+            std::filesystem::remove(destFile, rmEc);
+            result.statusCode = 0;
+            result.error = err.empty() ? "Download failed" : err;
+            result.bytesWritten = globalWritten.load();
+            return result;
+        }
+
+        result.statusCode = 206;
+        result.finalUrl = url;
+        result.etag = std::move(etag);
+        result.lastModified = std::move(lastModified);
+        result.expectedBytes = totalBytes;
+        result.bytesWritten = totalBytes;
         return result;
     }
 
