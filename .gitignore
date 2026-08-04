@@ -2,3 +2,4 @@ build/
 .xmake/
 # mcpp build artefacts
 target/
+compile_commands.json
