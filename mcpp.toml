@@ -1,8 +1,12 @@
+# Local fork of mcpplibs/tinyhttps 0.2.9 with segmented parallel downloads
+# (HTTP Range multi-connection, aria2-style). All existing API is unchanged;
+# the new surface is HttpClientConfig.maxConnectionsPerFile and
+# HttpClient::download_to_file_parallel().
 [package]
 namespace   = "mcpplibs"
 name        = "tinyhttps"
-version     = "0.2.9"
-description = "Minimal C++23 HTTP/HTTPS client with SSE streaming support"
+version     = "0.3.0"
+description = "Minimal C++23 HTTP/HTTPS client (fork: + Range segmented parallel download)"
 license     = "Apache-2.0"
 repo        = "https://github.com/mcpplibs/tinyhttps"
 
