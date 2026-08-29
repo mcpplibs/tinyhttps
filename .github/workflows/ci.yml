@@ -1,42 +1,78 @@
 name: CI
 
+# THE BUILD TOOL IS NAMED HERE AND NOWHERE ELSE.
+#
+# This workflow used to install it through `.xlings.json', a workspace pin that
+# `actions/checkout' places in the working directory before anything else runs.
+# Two consequences followed and neither was visible in a passing log:
+#
+#   * every `mcpp' invocation in this repository resolved to the pinned version
+#     rather than to the one the job had installed, because that pin is read
+#     from the current directory;
+#   * the pin named 0.0.13, from 2026-05. The index no longer serves the
+#     toolchain packages a build tool of that age asks for, so `mcpp build'
+#     ended at `package 'xim:glibc@>=2.39' not found' before compiling a line.
+#
+# The pin file is removed. The version is an environment variable, so the two
+# places that need it, the install and the cache, cannot drift apart again.
+
 on:
   push:
     branches: [master]
   pull_request:
+  # A CANARY, BECAUSE THIS ROTTED WHERE NOTHING WOULD LOOK.
+  #
+  # The breakage above occurred between 2026-07-11 and 2026-08-29 and nothing
+  # reported it: master received no pushes in that window, so the first run to
+  # meet it was a contributor's pull request, whose author had no way to
+  # distinguish a broken environment from a broken change.
+  schedule:
+    - cron: '0 6 * * 1'
+  workflow_dispatch:
+
+env:
+  MCPP_VERSION: 2026.8.29.1
+  XLINGS_VERSION: v2026.8.17.2
+  XLINGS_NON_INTERACTIVE: '1'
 
 jobs:
   build:
     name: build + test (linux x86_64, mcpp)
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
 
       - name: Install xlings
-        env:
-          XLINGS_VERSION: 0.4.31
         run: |
-          tarball="xlings-${XLINGS_VERSION}-linux-x86_64.tar.gz"
-          curl -fsSL -o "/tmp/${tarball}" \
-            "https://github.com/d2learn/xlings/releases/download/v${XLINGS_VERSION}/${tarball}"
-          tar -xzf "/tmp/${tarball}" -C /tmp
-          "/tmp/xlings-${XLINGS_VERSION}-linux-x86_64/subos/default/bin/xlings" self install
+          curl -fsSL https://raw.githubusercontent.com/openxlings/xlings/main/tools/other/quick_install.sh \
+            | bash -s "$XLINGS_VERSION"
           echo "$HOME/.xlings/subos/current/bin" >> "$GITHUB_PATH"
 
-      - name: Refresh package index
-        run: xlings update
+      - name: Install mcpp
+        run: |
+          xlings update
+          xlings install "mcpp@$MCPP_VERSION" -y -g
+          # The version this job runs is the version it prints. A pin that is
+          # not read is the failure this file exists to stop repeating.
+          mcpp --version
+          # A runner outside China reaches the mirrors this names. The CN set is
+          # for a developer's machine and is slower or unreachable from here.
+          mcpp self config --mirror GLOBAL
 
-      - name: Install workspace tools (.xlings.json → mcpp 0.0.13)
-        run: xlings install -y
-
+      # The toolchain mcpp bootstraps is decided by the version pinned above, so
+      # that version is the whole of the key.
       - name: Cache mcpp sandbox
         uses: actions/cache@v4
         with:
-          path: ~/.xlings/data/xpkgs/xim-x-mcpp/0.0.13/registry
-          key: mcpp-sandbox-${{ runner.os }}-mcpp0.0.13
+          path: ~/.xlings/data/xpkgs/xim-x-mcpp/${{ env.MCPP_VERSION }}/registry
+          key: mcpp-sandbox-${{ runner.os }}-mcpp${{ env.MCPP_VERSION }}
 
       - name: Build with mcpp
         run: mcpp build
 
+      # Six of these reach httpbin.org. They were here before this change and
+      # are left as they were. A network failure among them is distinguishable
+      # in the log by the endpoint it names.
       - name: Run tests
         run: mcpp test

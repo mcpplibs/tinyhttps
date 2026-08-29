@@ -2,3 +2,5 @@ build/
 .xmake/
 # mcpp build artefacts
 target/
+# mcpp writes this beside the manifest on every build
+compile_commands.json
