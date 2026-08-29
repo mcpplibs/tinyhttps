@@ -242,6 +242,37 @@ static int parse_hex(std::string_view s) {
     return result;
 }
 
+// `Content-Length`, rejected rather than salvaged.
+//
+// Both readers parsed this by walking the characters and keeping the digits, so
+// `12abc` was 12, `abc` was 0 — indistinguishable from a genuine `0` — and a
+// value past the width of the accumulator wrapped in silence. A length is the
+// number of bytes the reader will then trust, so a wrong one is not a cosmetic
+// error: too small leaves the next response's bytes in the stream, and too
+// large waits for bytes that are not coming.
+//
+// Shaped like `parse_chunk_size_line` above, and exported for the same reason:
+// it is the half of the body framing that can be examined without a server.
+export std::optional<std::int64_t>
+parse_content_length(std::string_view value) {
+    // A field value may carry optional whitespace on either side (RFC 9110).
+    while (!value.empty() && (value.front() == ' ' || value.front() == '\t'))
+        value.remove_prefix(1);
+    while (!value.empty() && (value.back() == ' ' || value.back() == '\t'))
+        value.remove_suffix(1);
+    if (value.empty()) return std::nullopt;
+
+    std::uint64_t parsed {};
+    auto [end, error] = std::from_chars(
+        value.data(), value.data() + value.size(), parsed, 10);
+    if (error != std::errc{} || end != value.data() + value.size()
+        || parsed > static_cast<std::uint64_t>(
+            std::numeric_limits<std::int64_t>::max())) {
+        return std::nullopt;
+    }
+    return static_cast<std::int64_t>(parsed);
+}
+
 export std::optional<std::int64_t>
 parse_chunk_size_line(std::string_view line) {
     if (line.empty()) return std::nullopt;
@@ -254,6 +285,25 @@ parse_chunk_size_line(std::string_view line) {
         return std::nullopt;
     }
     return static_cast<std::int64_t>(value);
+}
+
+// A streaming request that fails is answered with an error document, not an
+// event stream, so SseParser finds no event boundary in it and yields nothing.
+// The bytes are still worth keeping: without them a caller can report the
+// status line but never the reason. Bounded, so a server answering 5xx with an
+// endless body cannot grow the buffer without limit.
+export inline constexpr std::size_t stream_error_body_limit = 1024 * 1024;
+
+// Appends as much of `data` as `limit` still allows. Returns false once the
+// buffer is full, so a caller can stop copying without tracking sizes itself.
+export bool append_within_limit(std::string& buffer, std::string_view data,
+                                std::size_t limit) {
+    if (buffer.size() >= limit) return false;
+    const std::size_t room = limit - buffer.size();
+    // Not std::min: <winsock2.h> defines a `min` macro on Windows.
+    const std::size_t take = data.size() < room ? data.size() : room;
+    buffer.append(data.substr(0, take));
+    return take == data.size();
 }
 
 // Case-insensitive string comparison
@@ -459,12 +509,11 @@ private:
                     chunked = true;
                 }
                 if (iequals(key, "Content-Length")) {
-                    contentLength = 0;
-                    for (char c : valStr) {
-                        if (c >= '0' && c <= '9') {
-                            contentLength = contentLength * 10 + (c - '0');
-                        }
-                    }
+                    // Rejected rather than salvaged; parse_content_length says
+                    // why. A malformed value leaves this at -1, which is the
+                    // same state as an absent header and is a framing this
+                    // reader already handles.
+                    contentLength = parse_content_length(valStr).value_or(-1);
                 }
                 if (iequals(key, "Connection") && iequals(valStr, "close")) {
                     connectionClose = true;
@@ -704,6 +753,7 @@ public:
         // Read headers
         bool chunked = false;
         bool connectionClose = false;
+        std::int64_t contentLength = -1;
 
         while (true) {
             std::string headerLine = read_line(*sock, config_.readTimeoutMs);
@@ -726,14 +776,27 @@ public:
                 if (iequals(key, "Connection") && iequals(valStr, "close")) {
                     connectionClose = true;
                 }
+                // send() reads this and send_stream() did not, which is the
+                // same asymmetry this change exists to remove. See the body
+                // loop below for what its absence cost.
+                if (iequals(key, "Content-Length")) {
+                    contentLength = parse_content_length(valStr).value_or(-1);
+                }
             }
         }
 
         // Stream body incrementally, feeding chunks to SseParser
         SseParser parser;
         bool stopped = false;
+        // send() fills `body` on every path including failures; without this
+        // send_stream would be the one entry point that drops it. Capturing is
+        // additive — events are still parsed and dispatched exactly as before.
+        const bool captureBody = !response.ok();
 
         auto dispatch = [&](std::string_view data) -> bool {
+            if (captureBody) {
+                append_within_limit(response.body, data, stream_error_body_limit);
+            }
             auto events = parser.feed(data);
             for (const auto& ev : events) {
                 if (!callback(ev)) {
@@ -756,7 +819,22 @@ public:
                     sizeLine.pop_back();
                 }
 
-                int chunkSize = parse_hex(sizeLine);
+                // A CHUNK HEADER THAT DOES NOT PARSE IS NOT A TERMINAL CHUNK.
+                //
+                // `parse_hex` returned what it had accumulated when it met a
+                // character it did not recognise, and zero for an empty line —
+                // and `read_line` returns an empty line on a timeout or a
+                // closed connection. So a stream that was cut short read as a
+                // stream that ended cleanly, and this loop reported success.
+                // #9 established `parse_chunk_size_line` for exactly this and
+                // it reached only `download_to_file`.
+                auto parsedChunkSize = parse_chunk_size_line(sizeLine);
+                if (!parsedChunkSize) {
+                    response.statusText = "Invalid chunk size: " + sizeLine;
+                    connectionClose = true;
+                    break;
+                }
+                int chunkSize = static_cast<int>(*parsedChunkSize);
                 if (chunkSize == 0) {
                     // Terminal chunk — read trailing \r\n
                     read_line(*sock, config_.readTimeoutMs);
@@ -775,8 +853,44 @@ public:
                     break;
                 }
             }
+        } else if (contentLength >= 0) {
+            // A DECLARED LENGTH IS READ AND THE READER THEN STOPS.
+            //
+            // This branch did not exist: a response that was not chunked was
+            // read until the connection closed, whatever its headers said. On
+            // the library's own defaults — `keepAlive = true`, so the request
+            // carries `Connection: keep-alive` — the server does not close,
+            // and the loop below ran until `readTimeoutMs` expired.
+            //
+            // Measured against httpbin's `/status/418`, which answers with a
+            // Content-Length and keeps the connection:
+            //
+            //     keepAlive = false   status=418 body=135   elapsed  1370 ms
+            //     keepAlive = true    status=418 body=135   elapsed  9379 ms   (readTimeoutMs = 8000)
+            //
+            // The error body arrived either way, and on the defaults it arrived
+            // a full read timeout late — sixty seconds, as the defaults stand.
+            // `send()` has had this branch throughout, which is why the same
+            // request through it returns at once.
+            std::int64_t remaining = contentLength;
+            char buf[4096];
+            while (!stopped && remaining > 0) {
+                if (!sock->wait_readable(config_.readTimeoutMs)) {
+                    break;
+                }
+                const auto want = static_cast<std::size_t>(
+                    remaining < static_cast<std::int64_t>(sizeof buf)
+                        ? remaining : static_cast<std::int64_t>(sizeof buf));
+                int ret = sock->read(buf, want);
+                if (ret <= 0) break;
+                remaining -= ret;
+                if (!dispatch(std::string_view(buf, static_cast<std::size_t>(ret)))) {
+                    break;
+                }
+            }
         } else {
-            // Not chunked — read until connection closes
+            // Neither chunked nor a declared length: the end of the body is the
+            // end of the connection, so the connection must not be reused.
             connectionClose = true;
             char buf[4096];
             while (!stopped) {
