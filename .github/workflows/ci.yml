@@ -45,7 +45,13 @@ jobs:
 
       - name: Install xlings
         run: |
-          curl -fsSL https://raw.githubusercontent.com/openxlings/xlings/main/tools/other/quick_install.sh \
+          # --retry-all-errors and not --retry alone: the first covers a
+          # transient HTTP status and a timeout, and what this step actually
+          # meets is a failure of the transport. Observed in this ecosystem as
+          # `curl: (35) Recv failure: Connection reset by peer', thirteen
+          # seconds into a job, before anything was built.
+          curl -fsSL --retry 3 --retry-all-errors --retry-delay 2 \
+            https://raw.githubusercontent.com/openxlings/xlings/main/tools/other/quick_install.sh \
             | bash -s "$XLINGS_VERSION"
           echo "$HOME/.xlings/subos/current/bin" >> "$GITHUB_PATH"
 
