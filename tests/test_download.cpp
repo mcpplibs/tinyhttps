@@ -20,6 +20,29 @@ TEST(ChunkedProtocol, AcceptsValidSizeAndTerminalChunk) {
     EXPECT_EQ(*https::parse_chunk_size_line("0"), 0);
 }
 
+TEST(StreamErrorBody, KeepsEverythingWhileUnderLimit) {
+    std::string buffer;
+    EXPECT_TRUE(https::append_within_limit(buffer, "abc", 8));
+    EXPECT_TRUE(https::append_within_limit(buffer, "de", 8));
+    EXPECT_EQ(buffer, "abcde");
+}
+
+TEST(StreamErrorBody, TruncatesTheChunkThatCrossesTheLimit) {
+    std::string buffer = "abc";
+    EXPECT_FALSE(https::append_within_limit(buffer, "defgh", 5));
+    EXPECT_EQ(buffer, "abcde");
+}
+
+TEST(StreamErrorBody, RefusesFurtherDataOnceFull) {
+    std::string buffer = "abcde";
+    EXPECT_FALSE(https::append_within_limit(buffer, "f", 5));
+    EXPECT_EQ(buffer, "abcde");
+    // A zero limit must not append anything, not even an empty append.
+    std::string empty;
+    EXPECT_FALSE(https::append_within_limit(empty, "a", 0));
+    EXPECT_TRUE(empty.empty());
+}
+
 TEST(DownloadResultContract, CarriesTransferAndResponseMetadata) {
     https::DownloadToFileResult result;
     result.bytesWritten = 42;
@@ -34,6 +57,38 @@ TEST(DownloadResultContract, CarriesTransferAndResponseMetadata) {
     EXPECT_EQ(result.finalUrl, "https://example.test/final");
     EXPECT_EQ(result.etag, "\"abc\"");
     EXPECT_FALSE(result.lastModified.empty());
+}
+
+// Test that a failed streaming request carries its error body, against a real
+// HTTPS endpoint. httpbin's /status/418 answers non-2xx with a body, which is
+// exactly the shape SseParser cannot turn into events.
+
+class StreamErrorBodyLiveTest : public ::testing::Test {
+protected:
+    void SetUp() override { https::Socket::platform_init(); }
+};
+
+TEST_F(StreamErrorBodyLiveTest, FailedStreamKeepsTheErrorBody) {
+    https::HttpClientConfig cfg;
+    cfg.connectTimeoutMs = 15000;
+    cfg.readTimeoutMs = 30000;
+    cfg.keepAlive = false;  // so the server closes and the read loop ends
+    https::HttpClient client(cfg);
+
+    https::HttpRequest req;
+    req.method = https::Method::GET;
+    req.url = "https://httpbin.org/status/418";
+
+    int events = 0;
+    auto res = client.send_stream(req, [&](const https::SseEvent&) {
+        ++events;
+        return true;
+    });
+
+    EXPECT_EQ(res.statusCode, 418);
+    EXPECT_EQ(events, 0) << "an error document is not an event stream";
+    EXPECT_FALSE(res.body.empty()) << "error body was dropped";
+    EXPECT_NE(res.body.find("teapot"), std::string::npos);
 }
 
 // Test download_to_file against a real HTTPS endpoint.

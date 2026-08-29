@@ -256,6 +256,25 @@ parse_chunk_size_line(std::string_view line) {
     return static_cast<std::int64_t>(value);
 }
 
+// A streaming request that fails is answered with an error document, not an
+// event stream, so SseParser finds no event boundary in it and yields nothing.
+// The bytes are still worth keeping: without them a caller can report the
+// status line but never the reason. Bounded, so a server answering 5xx with an
+// endless body cannot grow the buffer without limit.
+export inline constexpr std::size_t stream_error_body_limit = 1024 * 1024;
+
+// Appends as much of `data` as `limit` still allows. Returns false once the
+// buffer is full, so a caller can stop copying without tracking sizes itself.
+export bool append_within_limit(std::string& buffer, std::string_view data,
+                                std::size_t limit) {
+    if (buffer.size() >= limit) return false;
+    const std::size_t room = limit - buffer.size();
+    // Not std::min: <winsock2.h> defines a `min` macro on Windows.
+    const std::size_t take = data.size() < room ? data.size() : room;
+    buffer.append(data.substr(0, take));
+    return take == data.size();
+}
+
 // Case-insensitive string comparison
 static bool iequals(std::string_view a, std::string_view b) {
     if (a.size() != b.size()) return false;
@@ -732,8 +751,15 @@ public:
         // Stream body incrementally, feeding chunks to SseParser
         SseParser parser;
         bool stopped = false;
+        // send() fills `body` on every path including failures; without this
+        // send_stream would be the one entry point that drops it. Capturing is
+        // additive — events are still parsed and dispatched exactly as before.
+        const bool captureBody = !response.ok();
 
         auto dispatch = [&](std::string_view data) -> bool {
+            if (captureBody) {
+                append_within_limit(response.body, data, stream_error_body_limit);
+            }
             auto events = parser.feed(data);
             for (const auto& ev : events) {
                 if (!callback(ev)) {
