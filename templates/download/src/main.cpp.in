@@ -1,0 +1,92 @@
+// {{project.name}} — scaffolded from {{template.package.selector}}@{{template.package.version}}:{{template.name}}
+//
+// A file downloaded to disk rather than into memory, with progress and a way to
+// stop. `download_to_file` streams: the body never exists as one buffer, so the
+// size of the file is not the size of the process.
+
+import mcpplibs.tinyhttps;
+import std;
+
+namespace https = mcpplibs::tinyhttps;
+
+namespace {
+
+std::string human(std::int64_t bytes) {
+    constexpr const char* units[] = { "B", "KiB", "MiB", "GiB", "TiB" };
+    double value = static_cast<double>(bytes);
+    std::size_t unit = 0;
+    while (value >= 1024.0 && unit + 1 < std::size(units)) {
+        value /= 1024.0;
+        ++unit;
+    }
+    return std::format("{:.1f} {}", value, units[unit]);
+}
+
+void draw_progress(std::int64_t total, std::int64_t done) {
+    // A server need not declare a length: chunked and connection-close framings
+    // both report total == 0, and a bar with no end is a lie rather than a bar.
+    if (total <= 0) {
+        std::print(std::cout, "\r  {} downloaded", human(done));
+        std::cout << std::flush;
+        return;
+    }
+    constexpr int width = 32;
+    const int filled = static_cast<int>(width * done / total);
+    // `std::print(std::cout, ...)` rather than `std::print(...)`: the second
+    // writes to the C stream `stdout`, and flushing that needs the `stdout`
+    // macro from <cstdio>, which `import std` does not carry. A progress bar
+    // that is not flushed does not appear until the download finishes.
+    std::print(std::cout, "\r  [{}{}] {:>3}%  {} / {}",
+               std::string(filled, '#'), std::string(width - filled, '.'),
+               100 * done / total, human(done), human(total));
+    std::cout << std::flush;
+}
+
+} // namespace
+
+int main(int argc, char** argv) {
+    https::Socket::platform_init();
+
+    const std::string url = argc > 1 ? argv[1] : "https://httpbin.org/bytes/65536";
+    const std::filesystem::path destination =
+        argc > 2 ? std::filesystem::path(argv[2]) : std::filesystem::path("out/download.bin");
+
+    https::HttpClientConfig config;
+    config.connectTimeoutMs = 15000;
+    config.readTimeoutMs = 30000;
+    https::HttpClient client(config);
+
+    std::println("GET {}\n  -> {}", url, destination.string());
+
+    // Set this from a signal handler, another thread, or a UI button. It is
+    // checked between blocks, so a cancelled download stops promptly and the
+    // connection is dropped rather than reused half-read.
+    std::atomic<bool> cancelled { false };
+
+    const auto started = std::chrono::steady_clock::now();
+    auto result = client.download_to_file(
+        url, destination,
+        [](std::int64_t total, std::int64_t done) { draw_progress(total, done); },
+        [&] { return cancelled.load(); });
+    const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - started);
+    std::println("");
+
+    if (!result.ok()) {
+        // `error` distinguishes a refusal ("HTTP 404") from a transfer that
+        // broke, and `bytesWritten` says how far it got either way.
+        std::println(std::cerr, "failed after {}: {}",
+                     human(result.bytesWritten), result.error);
+        return 1;
+    }
+
+    std::println("{} in {} ms", human(result.bytesWritten), elapsed.count());
+
+    // Kept so a later run can ask the server whether the file changed, with
+    // `If-None-Match` / `If-Modified-Since`.
+    if (!result.etag.empty())         std::println("  ETag: {}", result.etag);
+    if (!result.lastModified.empty()) std::println("  Last-Modified: {}", result.lastModified);
+    if (result.expectedBytes)         std::println("  declared length: {}", *result.expectedBytes);
+
+    return 0;
+}

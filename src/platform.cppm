@@ -16,7 +16,37 @@ import std;
 // live. Everything else (socket.cppm, http.cppm…) stays portable and branches
 // on `platform::is_windows` with `if constexpr`, never raw #ifdef.
 //
-// Sole concern today: hostname resolution on platforms where libc can't do it.
+// ── The platforms this library is known to run on, and what differs ──────────
+//
+// | platform          | not raising SIGPIPE      | notes                      |
+// |-------------------|--------------------------|----------------------------|
+// | Linux, Android    | MSG_NOSIGNAL on send()   |                            |
+// | Termux            | MSG_NOSIGNAL on send()   | manual DNS, below          |
+// | macOS, the BSDs   | SO_NOSIGPIPE on socket() | no MSG_NOSIGNAL            |
+// | Windows           | nothing to do            | no SIGPIPE, neither macro  |
+// | above openkal     | MSG_NOSIGNAL, and moot   | see below                  |
+//
+// ⭐ ABOVE openkal there are no signals at all, so the hazard issue #16
+// describes cannot arise — and the same code is nevertheless correct there
+// without a branch. openkal-musl defines MSG_NOSIGNAL
+// (`musl/include/sys/socket.h:344`) and accepts it as a no-op, in its own words:
+// "MSG_NOSIGNAL asks that a signal not be raised. There are no signals here, so
+// the request is satisfied by there being nothing to raise"
+// (`port/src/okm_net.c:546-550`); a flag it does not know it refuses with
+// -ENOSYS (`:550`, `:592-593`). SO_NOSIGPIPE is a BSD spelling that musl does
+// not define, so `socket.cppm`'s `#ifdef` for it simply does not compile in.
+//
+// ⚠️ One difference that IS live above openkal: connect() completes before it
+// returns even on a non-blocking descriptor, because `kal_net_connect` has no
+// form that begins a connection and reports its outcome later
+// (`port/src/okm_net.c:454-467`). `Socket::connect_addrinfo` therefore never
+// sees EINPROGRESS, never reaches its poll, and `connectTimeoutMs` is not
+// enforced for the TCP connect on that stack. Nothing here can fix that — the
+// bound would have to come from openkal — and nothing here needs to know it at
+// compile time, which is why there is no `is_openkal`.
+//
+// Sole runtime concern today: hostname resolution on platforms where libc can't
+// do it.
 // A musl-static binary on Android/Termux can't resolve through getaddrinfo() —
 // libc reads /etc/resolv.conf, but Android's /etc is read-only with no
 // resolv.conf; Termux keeps its nameservers in $PREFIX/etc/resolv.conf, which

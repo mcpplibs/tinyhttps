@@ -1,0 +1,3 @@
+[template]
+description  = "Download a file to disk with a progress bar, resumable-friendly metadata and cancellation"
+post_message = "cd into the project, then `mcpp run -- <url> [destination]`."

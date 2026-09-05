@@ -1,0 +1,128 @@
+// {{project.name}} — scaffolded from {{template.package.selector}}@{{template.package.version}}:{{template.name}}
+//
+// Server-Sent Events. `send_stream` hands each event to a callback as it
+// arrives rather than returning a body at the end, which is what makes a
+// token-by-token completion possible.
+//
+// The endpoint here is the OpenAI chat-completions shape, which is what almost
+// every SSE-speaking API in this space implements; point OPENAI_BASE_URL at any
+// compatible service. The mechanism is not specific to it — any `text/event-stream`
+// endpoint works the same way.
+
+import mcpplibs.tinyhttps;
+import std;
+
+namespace https = mcpplibs::tinyhttps;
+
+namespace {
+
+// The one field this example needs out of each event's JSON payload. A real
+// program uses a JSON library; extracting one string does not justify one.
+std::optional<std::string> content_delta(std::string_view json) {
+    constexpr std::string_view key = "\"content\":";
+    auto at = json.find(key);
+    if (at == std::string_view::npos) return std::nullopt;
+    at = json.find('"', at + key.size());
+    if (at == std::string_view::npos) return std::nullopt;
+
+    std::string out;
+    for (std::size_t i = at + 1; i < json.size(); ++i) {
+        if (json[i] == '\\' && i + 1 < json.size()) {
+            switch (json[++i]) {
+                case 'n':  out.push_back('\n'); break;
+                case 't':  out.push_back('\t'); break;
+                case 'r':  break;
+                case 'u':  i += 4; break;          // left as-is by this sketch
+                default:   out.push_back(json[i]);
+            }
+            continue;
+        }
+        if (json[i] == '"') return out;
+        out.push_back(json[i]);
+    }
+    return std::nullopt;
+}
+
+std::string env_or(const char* name, std::string fallback) {
+    const char* value = std::getenv(name);
+    return (value != nullptr && *value != '\0') ? std::string(value) : std::move(fallback);
+}
+
+} // namespace
+
+int main(int argc, char** argv) {
+    https::Socket::platform_init();
+
+    const char* apiKey = std::getenv("OPENAI_API_KEY");
+    if (apiKey == nullptr || *apiKey == '\0') {
+        std::println(std::cerr,
+                     "OPENAI_API_KEY is not set.\n"
+                     "  export OPENAI_API_KEY=sk-...\n"
+                     "  export OPENAI_BASE_URL=https://api.openai.com   # or any compatible service\n"
+                     "  mcpp run -- \"your question\"");
+        return 0;   // not a failure: nothing was configured yet
+    }
+
+    const std::string baseUrl = env_or("OPENAI_BASE_URL", "https://api.openai.com");
+    const std::string model   = env_or("OPENAI_MODEL", "gpt-4o-mini");
+    const std::string prompt  = argc > 1 ? argv[1] : "Say hello in one sentence.";
+
+    // A streaming request is a long-lived one: the read timeout bounds the gap
+    // BETWEEN events, not the whole exchange, so it can stay modest.
+    https::HttpClientConfig config;
+    config.connectTimeoutMs = 15000;
+    config.readTimeoutMs = 60000;
+    https::HttpClient client(config);
+
+    https::HttpRequest request;
+    request.method = https::Method::POST;
+    request.url = baseUrl + "/v1/chat/completions";
+    request.headers.emplace("Content-Type", "application/json");
+    request.headers.emplace("Authorization", std::string("Bearer ") + apiKey);
+    request.headers.emplace("Accept", "text/event-stream");
+    // Concatenated rather than std::format'd. A format string emitting JSON has
+    // to double its braces, and a doubled opening brace is exactly how mcpp's
+    // template renderer opens a placeholder — so the format-string version of
+    // this line cannot survive being scaffolded. Concatenation has no such
+    // character; std::format is fine everywhere in the generated project.
+    request.body = "{\"model\":\"" + model + "\",\"stream\":true,"
+                   "\"messages\":[{\"role\":\"user\",\"content\":\"" + prompt + "\"}]}";
+
+    std::size_t events = 0;
+    auto response = client.send_stream(request, [&](const https::SseEvent& event) {
+        ++events;
+        // The sentinel that ends an OpenAI-shaped stream. Returning false stops
+        // the read; the connection is then dropped rather than reused, because
+        // bytes are still owed on it.
+        if (event.data == "[DONE]") return false;
+        if (auto delta = content_delta(event.data)) {
+            // Flushed through the C++ stream: `import std` carries no `stdout`
+            // macro, so a token printed without this would not appear until the
+            // stream ended — which defeats the point of streaming.
+            std::print(std::cout, "{}", *delta);
+            std::cout << std::flush;
+        }
+        return true;
+    });
+    std::println("");
+
+    if (response.statusCode == 0) {
+        std::println(std::cerr, "request failed: {}", response.statusText);
+        return 1;
+    }
+    if (!response.ok()) {
+        // A failed streaming request is answered with an error document, not an
+        // event stream — so the parser yields nothing and the bytes land in
+        // `body` instead. Without them there is a status code and no reason.
+        std::println(std::cerr, "{} {}\n{}",
+                     response.statusCode, response.statusText, response.body);
+        return 1;
+    }
+
+    // `bodyComplete` is false when the stream ended before its framing said it
+    // would — and also when the callback above stopped it, which is the ordinary
+    // way an SSE exchange ends. `bodyError` distinguishes the two.
+    std::println(std::cerr, "\n[{} events, {}]", events,
+                 response.bodyComplete ? "stream ended cleanly" : response.bodyError);
+    return 0;
+}

@@ -52,17 +52,49 @@ static int bio_send(void* ctx, const unsigned char* buf, size_t len) {
     return ret;
 }
 
+// A ZERO IS PASSED THROUGH, AND THAT IS THE WHOLE CONTRACT.
+//
+// This used to answer a `recv` of 0 — a peer that sent FIN, which is how nearly
+// every server ends a connection-close-delimited response — with
+// MBEDTLS_ERR_NET_CONN_RESET. mbedtls's own BIO does not: `mbedtls_net_recv`
+// returns `read()`'s result unchanged and reserves CONN_RESET for an actual
+// ECONNRESET/EPIPE (net_sockets.c). The distinction is not cosmetic, because
+// `mbedtls_ssl_fetch_input` tests for exactly this zero —
+//
+//     if (ret == 0) { return MBEDTLS_ERR_SSL_CONN_EOF; }   ssl_msg.c:2251, :2320
+//
+// — and passes any negative value straight through. So the old mapping made an
+// orderly end of stream indistinguishable from a transport error, one layer
+// below `TlsSocket::read_some`, which then had to call it `Error`. A body whose
+// framing IS the close then read as truncated: `download_to_file` set
+// `result.error` and `ok()` returned false for a file that had arrived
+// complete and correct.
 static int bio_recv(void* ctx, unsigned char* buf, size_t len) {
     auto* sock = static_cast<Socket*>(ctx);
     int ret = sock->read(reinterpret_cast<char*>(buf), static_cast<int>(len));
     if (ret < 0) {
         return MBEDTLS_ERR_NET_RECV_FAILED;
     }
-    if (ret == 0) {
-        return MBEDTLS_ERR_NET_CONN_RESET;
-    }
-    return ret;
+    return ret;   // 0 means end of stream; mbedtls turns it into SSL_CONN_EOF
 }
+
+// WHAT A READ ENDED IN, WHICH `int` COULD NOT SAY.
+//
+// `TlsSocket::read` returned 0 for a peer that had closed AND for a transport
+// that had no bytes ready yet, so every caller had to guess. They all guessed
+// the same way — wait once more and try again — and a reader that cannot tell
+// "the body ended here" from "nothing yet" cannot decide whether the connection
+// is still reusable. That is root cause R3 behind issue #15.
+//
+// `Eof` is a fact about the stream and `WouldBlock` is a fact about this
+// instant; naming them apart is what lets `read_body` below return `Complete`
+// rather than a guess.
+export enum class ReadStatus { Data, WouldBlock, Eof, Error };
+
+export struct ReadResult {
+    ReadStatus status { ReadStatus::Error };
+    int bytes { 0 };   // meaningful only when status == Data
+};
 
 export class TlsSocket {
 public:
@@ -117,22 +149,46 @@ public:
         return setup_tls(host, verifySsl);
     }
 
-    int read(char* buf, int len) {
-        if (!is_valid()) return -1;
+    // The read that says which of the four things happened. Prefer it over
+    // `read` below wherever the answer changes what the caller does.
+    ReadResult read_some(char* buf, int len) {
+        if (!is_valid()) return { ReadStatus::Error, 0 };
         int ret = mbedtls_ssl_read(&state_->ssl,
             reinterpret_cast<unsigned char*>(buf), static_cast<size_t>(len));
-        if (ret == MBEDTLS_ERR_SSL_PEER_CLOSE_NOTIFY || ret == 0) {
-            return 0; // Connection closed
+        // Three spellings of "there is nothing more coming", and all three are
+        // an end of stream rather than a failure: the peer shut the session
+        // down politely, the transport reached its end (what `bio_recv`'s zero
+        // becomes), or mbedtls had nothing left to hand back. Most servers do
+        // NOT send close_notify before closing, so the middle one is the common
+        // case rather than the exotic one.
+        if (ret == MBEDTLS_ERR_SSL_PEER_CLOSE_NOTIFY
+            || ret == MBEDTLS_ERR_SSL_CONN_EOF
+            || ret == 0) {
+            return { ReadStatus::Eof, 0 };
         }
-        if (ret < 0) {
-            if (ret == MBEDTLS_ERR_SSL_WANT_READ || ret == MBEDTLS_ERR_SSL_WANT_WRITE) {
-                return 0; // Would block, treat as no data yet
-            }
-            return -1;
+        if (ret == MBEDTLS_ERR_SSL_WANT_READ || ret == MBEDTLS_ERR_SSL_WANT_WRITE) {
+            return { ReadStatus::WouldBlock, 0 };
         }
-        return ret;
+        if (ret < 0) return { ReadStatus::Error, 0 };
+        return { ReadStatus::Data, ret };
     }
 
+    // The older shape, kept because it is exported and callers outside this
+    // repository use it. It collapses Eof and WouldBlock back into 0, which is
+    // the ambiguity `read_some` exists to remove.
+    int read(char* buf, int len) {
+        auto r = read_some(buf, len);
+        switch (r.status) {
+            case ReadStatus::Data:       return r.bytes;
+            case ReadStatus::Eof:
+            case ReadStatus::WouldBlock: return 0;
+            case ReadStatus::Error:      return -1;
+        }
+        return -1;
+    }
+
+    // Returns 0 for "the transport is not ready", which `write_all` answers by
+    // waiting on the socket rather than by retrying immediately.
     int write(const char* buf, int len) {
         if (!is_valid()) return -1;
         int ret = mbedtls_ssl_write(&state_->ssl,
@@ -160,6 +216,14 @@ public:
             return true;
         }
         return socket_.wait_readable(timeoutMs);
+    }
+
+    // TLS back-pressure is a wait, not a failure. `mbedtls_ssl_write` reports
+    // WANT_WRITE when the record layer cannot flush, and `write` above turns
+    // that into 0; without something to wait on, `write_all` could only retry
+    // at once and then give up, which reached the caller as "Write failed".
+    bool wait_writable(int timeoutMs) {
+        return socket_.wait_writable(timeoutMs);
     }
 
 private:

@@ -2,5 +2,12 @@ build/
 .xmake/
 # mcpp build artefacts
 target/
+gcm.cache/
+# Resolution record, not a pin — the file says so itself: "It does not yet pin
+# future builds: index dependencies are re-resolved from their constraints each
+# time." A library's consumers re-resolve from its constraints, so committing it
+# records one machine's resolution and changes nothing about anyone else's.
+# Every other mcpplibs package ignores it, including the scaffold template.
+mcpp.lock
 # mcpp writes this beside the manifest on every build
 compile_commands.json

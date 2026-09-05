@@ -77,8 +77,73 @@ jobs:
       - name: Build with mcpp
         run: mcpp build
 
-      # Six of these reach httpbin.org. They were here before this change and
-      # are left as they were. A network failure among them is distinguishable
-      # in the log by the endpoint it names.
+      # Most of these are hermetic: `test_framing` needs nothing, and `test_pool`
+      # scripts its own TLS server on 127.0.0.1. The eight in `test_download`
+      # and `test_resolver` reach httpbin.org and one.one.one.one; a network
+      # failure among them is distinguishable in the log by the endpoint it
+      # names.
       - name: Run tests
         run: mcpp test
+
+      # A TEMPLATE IS PART OF THE RELEASE THAT SHIPS IT, AND `mcpp new` CAN ONLY
+      # REACH ONE THAT IS ALREADY PUBLISHED. Checking them after the release
+      # makes the first person to run `mcpp new` the one who finds out they do
+      # not compile, so this renders them the way the scaffolder does and builds
+      # them against this commit. It has already caught one: `import std`
+      # carries no `stdout` macro, so a progress bar flushed through it did not
+      # compile in a generated project while compiling fine in this repository.
+      - name: Smoke-test the project templates
+        run: bash tools/template_smoke.sh
+
+  # ── The same sources, on a different kernel ABI ──────────────────────────────
+  #
+  # WHY THIS IS A SEPARATE JOB AND NOT A STEP. It resolves a different toolchain
+  # (llvm rather than gcc) and a different everything below the program — musl
+  # ported onto openkal, libc++ configured for that musl, and openkal-linux
+  # beneath both. Sharing a job would mean sharing a cache key between two
+  # stacks that have nothing in common but the source tree.
+  #
+  # WHAT IT CATCHES THAT THE JOB ABOVE CANNOT. `Socket::write` sends with
+  # MSG_NOSIGNAL and `connect_addrinfo` sets SO_NOSIGPIPE, and which of those
+  # exists is decided by the C library rather than by the operating system —
+  # openkal-musl defines the first and not the second. A `#ifdef` that is wrong
+  # about that compiles cleanly here and fails there, which is exactly how
+  # 5e7d66f reached master.
+  openkal:
+    name: build + run (linux x86_64, above openkal)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install xlings
+        run: |
+          curl -fsSL --retry 3 --retry-all-errors --retry-delay 2 \
+            https://raw.githubusercontent.com/openxlings/xlings/main/tools/other/quick_install.sh \
+            | bash -s "$XLINGS_VERSION"
+          echo "$HOME/.xlings/subos/current/bin" >> "$GITHUB_PATH"
+
+      - name: Install mcpp
+        run: |
+          xlings update
+          xlings install "mcpp@$MCPP_VERSION" -y -g
+          mcpp --version
+          mcpp self config --mirror GLOBAL
+
+      - name: Cache mcpp sandbox
+        uses: actions/cache@v4
+        with:
+          path: ~/.xlings/data/xpkgs/xim-x-mcpp/${{ env.MCPP_VERSION }}/registry
+          key: mcpp-openkal-${{ runner.os }}-mcpp${{ env.MCPP_VERSION }}
+
+      # The example builds the library from this checkout (`path = "../.."`) and
+      # takes the stack beneath it from the index, so what is tested is this
+      # commit against the published openkal packages.
+      #
+      # It makes one HTTPS request and reports "no network" rather than failing
+      # when there is none, so a runner without egress reports "not run" instead
+      # of "broken". The build, the link and the framing parsers are checked
+      # either way.
+      - name: Build and run above openkal
+        working-directory: examples/openkal
+        run: mcpp run

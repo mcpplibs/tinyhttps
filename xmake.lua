@@ -7,7 +7,7 @@ add_requires("gtest 1.15.2", { optional = true })
 
 target("tinyhttps")
     set_kind("static")
-    set_version("0.1.0")
+    set_version("0.3.0")
     add_files("src/*.cppm", { public = true, install = true })
     add_packages("mbedtls", { public = true })
     set_policy("build.c++.modules", true)
