@@ -127,6 +127,42 @@ public:
                 continue;
             }
 
+            // macOS and the BSDs spell "do not raise a signal" as a socket
+            // option rather than as a send flag; `write` below carries the flag
+            // for the platforms that have one.
+            //
+            // ⭐ NOTHING SELECTS THIS AND NOTHING MAY. It is not a feature, not
+            // a config field and not a runtime probe: the preprocessor reads the
+            // target's own <sys/socket.h> and the answer is already complete.
+            // Measured on this machine — glibc: SO_NOSIGPIPE absent,
+            // MSG_NOSIGNAL 0x4000; musl (Termux, Alpine, openkal-musl):
+            // SO_NOSIGPIPE absent, MSG_NOSIGNAL 0x4000; Darwin/BSD: the reverse;
+            // Windows: neither, and no SIGPIPE to raise.
+            //
+            // Making it selectable would be actively wrong. A consumer who left
+            // it off on macOS would get exactly issue #16 — the process killed
+            // by a signal it never armed — and would get it silently, on a
+            // platform they may not build for themselves. A property that only
+            // prevents harm and costs one setsockopt is not a choice worth
+            // offering; there is no target where the name exists and setting it
+            // is undesirable.
+            //
+            // This does NOT touch the process's signal disposition, so a program
+            // that wants SIGPIPE on its own stdout still gets it. That is the
+            // whole reason to prefer this over mbedtls's `signal(SIGPIPE,
+            // SIG_IGN)`, which changes it for everything the host does.
+            //
+            // Best-effort: a failure leaves the socket with the disposition it
+            // had before this line.
+            //
+            // #ifdef, not `if constexpr`: the name does not exist on Linux or
+            // Windows, and both arms of an `if constexpr` must compile.
+#ifdef SO_NOSIGPIPE
+            int nosigpipe = 1;
+            ::setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE,
+                         reinterpret_cast<const char*>(&nosigpipe), sizeof(nosigpipe));
+#endif
+
             // Set non-blocking
             if (!set_non_blocking(fd, true)) {
                 close_handle(fd);
@@ -173,9 +209,39 @@ public:
         return static_cast<int>(::recv(fd_, buf, len, 0));
     }
 
+    // A WRITE TO A SOCKET WHOSE PEER HAS GONE AWAY RAISES SIGPIPE, AND A
+    // PROGRAM THAT HAS NOT DISARMED IT — THE DEFAULT — IS KILLED RATHER THAN
+    // TOLD. That is issue #16, and it is this library's defect rather than its
+    // caller's: the fd is one this class created, and the write that meets a
+    // dead peer is most often the `close_notify` the pool's own clean-up sends.
+    //
+    // mbedtls guards against this in `net_prepare` (net_sockets.c:114) with a
+    // process-wide `signal(SIGPIPE, SIG_IGN)`. This library replaces mbedtls's
+    // network layer with its own BIO and never calls `mbedtls_net_init`, so it
+    // dropped that guard without putting anything in its place. MSG_NOSIGNAL is
+    // the better replacement in any case: a library has no business changing
+    // its host's signal disposition.
+    //
+    // The failure travels along paths that already exist — `bio_send` maps a
+    // non-positive return to MBEDTLS_ERR_NET_SEND_FAILED, and `TlsSocket::close`
+    // already ignores what close_notify returns — so the successful path is
+    // unchanged byte for byte.
+    //
+    // #ifdef, not `if constexpr`: the macro does not exist on Windows (which has
+    // no SIGPIPE either) or on the BSDs (which use SO_NOSIGPIPE, set in
+    // `connect_addrinfo`), and both arms of an `if constexpr` must compile. That
+    // is the trap 5e7d66f fixed in the resolver stubs.
+    //
+    // Above openkal the flag is accepted and ignored — openkal has no signals at
+    // all (openkal-musl `port/src/okm_net.c:546-550`) — so this compiles and is
+    // correct there without a branch of its own.
     int write(const char* buf, int len) {
         if (!is_valid()) return -1;
+#ifdef MSG_NOSIGNAL
+        return static_cast<int>(::send(fd_, buf, len, MSG_NOSIGNAL));
+#else
         return static_cast<int>(::send(fd_, buf, len, 0));
+#endif
     }
 
     bool wait_readable(int timeoutMs) {

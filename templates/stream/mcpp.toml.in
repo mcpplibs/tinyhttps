@@ -1,0 +1,9 @@
+[package]
+name    = "{{project.name}}"
+version = "0.1.0"
+
+# The library this project was scaffolded from, pinned to the version that
+# shipped the template. mcpp injects this line when a template omits it; it is
+# written out here so the generated manifest says where the code came from.
+[dependencies.{{template.package.namespace}}]
+{{template.package.name}} = "{{template.package.version}}"

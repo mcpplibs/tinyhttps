@@ -1,0 +1,66 @@
+// {{project.name}} — scaffolded from {{template.package.selector}}@{{template.package.version}}:{{template.name}}
+//
+// One request, and the three separate questions worth asking about the answer.
+
+import mcpplibs.tinyhttps;
+import std;
+
+namespace https = mcpplibs::tinyhttps;
+
+int main(int argc, char** argv) {
+    // Required once per process. A no-op everywhere but Windows, where it is
+    // WSAStartup.
+    https::Socket::platform_init();
+
+    const std::string url = argc > 1 ? argv[1] : "https://httpbin.org/get";
+
+    // Defaults: 10s connect, 60s read, certificates verified, keep-alive on,
+    // up to 10 redirects. See HttpClientConfig for the rest.
+    https::HttpClient client;
+
+    https::HttpRequest request;
+    request.method = https::Method::GET;
+    request.url = url;
+    request.headers.emplace("Accept", "application/json");
+
+    auto response = client.send(request);
+
+    // ── 1. Did the request reach a server at all? ───────────────────────────
+    // statusCode 0 means nothing was received: DNS, TCP, TLS or a write that
+    // failed. statusText says which.
+    if (response.statusCode == 0) {
+        std::println(std::cerr, "{}: {}", url, response.statusText);
+        return 1;
+    }
+
+    // ── 2. What did the server say? ─────────────────────────────────────────
+    std::println("{} {}", response.statusCode, response.statusText);
+    for (const auto& [name, value] : response.headers) {
+        std::println("  {}: {}", name, value);
+    }
+
+    // ── 3. Did all of the body arrive? ──────────────────────────────────────
+    // A read that timed out, a connection that ended mid-body or a chunk header
+    // that did not parse all leave a PREFIX of the body behind an ordinary
+    // status code. ok() answers question 2 and deliberately not this one.
+    if (!response.bodyComplete) {
+        std::println(std::cerr, "warning: body is incomplete — {}", response.bodyError);
+    }
+
+    std::println("\n{}", response.body);
+    return response.ok() && response.bodyComplete ? 0 : 1;
+}
+
+// A POST with a JSON body is one line:
+//
+//     auto response = client.send(https::HttpRequest::post(
+//         "https://api.example.com/v1/things", R"({"name": "thing"})"));
+//
+// and an API key goes in the headers:
+//
+//     https::HttpRequest request;
+//     request.method = https::Method::POST;
+//     request.url    = "https://api.example.com/v1/things";
+//     request.body   = R"({"name": "thing"})";
+//     request.headers.emplace("Content-Type",  "application/json");
+//     request.headers.emplace("Authorization", "Bearer " + key);

@@ -1,0 +1,24 @@
+[package]
+name    = "tinyhttps-openkal"
+version = "0.1.0"
+
+# ONE LINE IS WHAT MAKES THIS AN openkal PROGRAM, AND IT IS NOT ABOUT tinyhttps.
+#
+# `openkal-llvm-runtime` carries libc++, libc++abi, libunwind and compiler-rt
+# configured for `openkal-musl`, which is musl ported onto the openkal kernel
+# ABI. Naming it replaces the whole layer beneath this program — C library,
+# C++ runtime and platform interface — and tinyhttps is compiled from the same
+# sources either way. That is the claim this directory exists to check.
+[dependencies]
+tinyhttps            = { path = "../.." }
+openkal-llvm-runtime = "0.9.1"
+
+[targets.smoke]
+kind = "bin"
+main = "src/main.cpp"
+
+# An ordinary compiler. Where the headers, C library, C++ runtime and platform
+# implementation come from is not stated here at all — it follows from the
+# dependency above.
+[toolchain]
+default = "llvm@22.1.8"

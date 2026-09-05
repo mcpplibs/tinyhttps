@@ -1,0 +1,4 @@
+[template]
+description  = "One HTTPS request, and how to tell a complete answer from a truncated one"
+default      = true
+post_message = "cd into the project, then `mcpp run` — or `mcpp run -- https://your.api/endpoint`."

@@ -1,109 +1,16 @@
-// Test must include gtest before import std to avoid GCC module redefinition errors
+// Live tests against a real HTTPS endpoint (httpbin.org).
+//
+// The framing parsers and the response contracts these used to also cover moved
+// to `test_framing.cpp`, and the connection-pool behaviour to `test_pool.cpp`,
+// which scripts its own server. What is left here is the part that genuinely
+// needs the internet: a real certificate chain, a real chunked stream, a real
+// redirect.
 #include <gtest/gtest.h>
 
 import mcpplibs.tinyhttps;
 import std;
 
 namespace https = mcpplibs::tinyhttps;
-
-TEST(ChunkedProtocol, RejectsEmptyInvalidAndOverflowSizeLines) {
-    EXPECT_FALSE(https::parse_chunk_size_line("").has_value());
-    EXPECT_FALSE(https::parse_chunk_size_line("xyz").has_value());
-    EXPECT_FALSE(https::parse_chunk_size_line("1g").has_value());
-    EXPECT_FALSE(https::parse_chunk_size_line("FFFFFFFFFFFFFFFF").has_value());
-}
-
-TEST(ChunkedProtocol, AcceptsValidSizeAndTerminalChunk) {
-    ASSERT_TRUE(https::parse_chunk_size_line("1a").has_value());
-    EXPECT_EQ(*https::parse_chunk_size_line("1a"), 26);
-    ASSERT_TRUE(https::parse_chunk_size_line("0").has_value());
-    EXPECT_EQ(*https::parse_chunk_size_line("0"), 0);
-}
-
-// `Content-Length` decides how many bytes a reader will trust, so a wrong
-// answer is not cosmetic: too small leaves the next response's bytes in the
-// stream and too large waits for bytes that are not coming.
-//
-// Both readers used to keep the digits and discard everything else. Measured,
-// by compiling that parser on its own:
-//
-//     "135"                  -> 135
-//     "0"                    -> 0
-//     "abc"                  -> 0                     <- a refusal read as a real zero
-//     "12abc"                -> 12                    <- stops twelve bytes in
-//     ""                     -> 0
-//     "-1"                   -> 1                     <- the sign is discarded
-//     "99999999999999999999" -> 7766279631452241919   <- wraps, in silence
-//
-// The last two are the ones no amount of care at the call site could recover
-// from, because the value it receives is a plausible number.
-TEST(ContentLength, AcceptsAWellFormedValue) {
-    ASSERT_TRUE(https::parse_content_length("135").has_value());
-    EXPECT_EQ(*https::parse_content_length("135"), 135);
-    // A field value may carry optional whitespace on either side.
-    ASSERT_TRUE(https::parse_content_length("  135\t").has_value());
-    EXPECT_EQ(*https::parse_content_length("  135\t"), 135);
-}
-
-// The one a salvaging parser cannot express. `abc` used to yield 0, which is
-// indistinguishable from a server that genuinely declared an empty body — and
-// the two call for opposite behaviour.
-TEST(ContentLength, AZeroIsDistinguishableFromARefusal) {
-    ASSERT_TRUE(https::parse_content_length("0").has_value());
-    EXPECT_EQ(*https::parse_content_length("0"), 0);
-    EXPECT_FALSE(https::parse_content_length("abc").has_value());
-}
-
-TEST(ContentLength, RejectsEmptyTrailingGarbageAndOverflow) {
-    EXPECT_FALSE(https::parse_content_length("").has_value());
-    EXPECT_FALSE(https::parse_content_length("   ").has_value());
-    // `12abc` used to be 12: the reader would then stop twelve bytes in and
-    // leave the rest of the body to be read as the next response.
-    EXPECT_FALSE(https::parse_content_length("12abc").has_value());
-    EXPECT_FALSE(https::parse_content_length("-1").has_value());
-    EXPECT_FALSE(https::parse_content_length("+1").has_value());
-    // Past the width of the accumulator, which used to wrap in silence.
-    EXPECT_FALSE(https::parse_content_length("99999999999999999999").has_value());
-}
-
-TEST(StreamErrorBody, KeepsEverythingWhileUnderLimit) {
-    std::string buffer;
-    EXPECT_TRUE(https::append_within_limit(buffer, "abc", 8));
-    EXPECT_TRUE(https::append_within_limit(buffer, "de", 8));
-    EXPECT_EQ(buffer, "abcde");
-}
-
-TEST(StreamErrorBody, TruncatesTheChunkThatCrossesTheLimit) {
-    std::string buffer = "abc";
-    EXPECT_FALSE(https::append_within_limit(buffer, "defgh", 5));
-    EXPECT_EQ(buffer, "abcde");
-}
-
-TEST(StreamErrorBody, RefusesFurtherDataOnceFull) {
-    std::string buffer = "abcde";
-    EXPECT_FALSE(https::append_within_limit(buffer, "f", 5));
-    EXPECT_EQ(buffer, "abcde");
-    // A zero limit must not append anything, not even an empty append.
-    std::string empty;
-    EXPECT_FALSE(https::append_within_limit(empty, "a", 0));
-    EXPECT_TRUE(empty.empty());
-}
-
-TEST(DownloadResultContract, CarriesTransferAndResponseMetadata) {
-    https::DownloadToFileResult result;
-    result.bytesWritten = 42;
-    result.expectedBytes = 42;
-    result.finalUrl = "https://example.test/final";
-    result.etag = "\"abc\"";
-    result.lastModified = "Wed, 21 Oct 2015 07:28:00 GMT";
-
-    EXPECT_EQ(result.bytesWritten, 42);
-    ASSERT_TRUE(result.expectedBytes.has_value());
-    EXPECT_EQ(*result.expectedBytes, 42);
-    EXPECT_EQ(result.finalUrl, "https://example.test/final");
-    EXPECT_EQ(result.etag, "\"abc\"");
-    EXPECT_FALSE(result.lastModified.empty());
-}
 
 // Test that a failed streaming request carries its error body, against a real
 // HTTPS endpoint. httpbin's /status/418 answers non-2xx with a body, which is

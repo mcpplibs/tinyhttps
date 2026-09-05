@@ -1,0 +1,3 @@
+[template]
+description  = "Server-Sent Events: a streaming LLM chat completion, token by token"
+post_message = "cd into the project, export OPENAI_API_KEY (and OPENAI_BASE_URL for an OpenAI-compatible service), then `mcpp run`."
