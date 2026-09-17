@@ -14,7 +14,7 @@ truncation at all, plus a `Content-Length` past 32 bits — and two more (the
 streaming reader's `Content-Length` exits) were regressions 0.2.10 had
 introduced.
 
-### ⚠️ Read this first
+### Read this first
 
 **If you are on 0.2.10 and use `send_stream`, upgrade.** 0.2.10 added a
 `Content-Length` branch to the streaming reader whose two exits — a read timeout

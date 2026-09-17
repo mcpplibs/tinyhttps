@@ -29,7 +29,16 @@
 #include <mbedtls/pk.h>
 #include <mbedtls/net_sockets.h>
 
-#ifdef _WIN32
+// The socket interface is chosen by the C library, not by the operating
+// system. On Windows with the platform's own C runtime it is Windows Sockets;
+// where the C library is POSIX-shaped (openkal-musl, selected in mcpp.toml by
+// `cfg(c-abi = "musl")`) it is the POSIX interface on every system, Windows
+// included.
+#if defined(_WIN32) && !defined(TINYHTTPS_POSIX_SOCKETS)
+#define TINYHTTPS_WINSOCK 1
+#endif
+
+#ifdef TINYHTTPS_WINSOCK
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #else

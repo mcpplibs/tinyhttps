@@ -1,6 +1,15 @@
 module;
 
-#ifdef _WIN32
+// The socket interface is chosen by the C library, not by the operating
+// system. On Windows with the platform's own C runtime it is Windows Sockets;
+// where the C library is POSIX-shaped (openkal-musl, selected in mcpp.toml by
+// `cfg(c-abi = "musl")`) it is the POSIX interface on every system, Windows
+// included.
+#if defined(_WIN32) && !defined(TINYHTTPS_POSIX_SOCKETS)
+#define TINYHTTPS_WINSOCK 1
+#endif
+
+#ifdef TINYHTTPS_WINSOCK
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #pragma comment(lib, "ws2_32.lib")
@@ -21,7 +30,7 @@ import :platform;
 
 namespace mcpplibs::tinyhttps {
 
-#ifdef _WIN32
+#ifdef TINYHTTPS_WINSOCK
 using SocketHandle = SOCKET;
 constexpr SocketHandle INVALID_SOCKET_FD = INVALID_SOCKET;
 #else
@@ -88,7 +97,7 @@ public:
             return ok;
         };
 
-        if constexpr (platform::is_windows) {
+        if constexpr (platform::uses_winsock) {
             return try_resolved(host, /*numeric=*/false);
         } else {
             // Fall back to a manual DNS query when libc can't resolve (Termux:
@@ -131,7 +140,7 @@ public:
             // option rather than as a send flag; `write` below carries the flag
             // for the platforms that have one.
             //
-            // ⭐ NOTHING SELECTS THIS AND NOTHING MAY. It is not a feature, not
+            // NOTHING SELECTS THIS AND NOTHING MAY. It is not a feature, not
             // a config field and not a runtime probe: the preprocessor reads the
             // target's own <sys/socket.h> and the answer is already complete.
             // Measured on this machine — glibc: SO_NOSIGPIPE absent,
@@ -175,7 +184,7 @@ public:
             if (rc == 0) {
                 connected = true;
             } else {
-#ifdef _WIN32
+#ifdef TINYHTTPS_WINSOCK
                 if (WSAGetLastError() == WSAEWOULDBLOCK) {
 #else
                 if (errno == EINPROGRESS) {
@@ -266,14 +275,14 @@ public:
     }
 
     static void platform_init() {
-#ifdef _WIN32
+#ifdef TINYHTTPS_WINSOCK
         WSADATA wsaData;
         WSAStartup(MAKEWORD(2, 2), &wsaData);
 #endif
     }
 
     static void platform_cleanup() {
-#ifdef _WIN32
+#ifdef TINYHTTPS_WINSOCK
         WSACleanup();
 #endif
     }
@@ -282,7 +291,7 @@ private:
     SocketHandle fd_ = INVALID_SOCKET_FD;
 
     static bool set_non_blocking(SocketHandle fd, bool nonBlocking) {
-#ifdef _WIN32
+#ifdef TINYHTTPS_WINSOCK
         u_long mode = nonBlocking ? 1 : 0;
         return ioctlsocket(fd, FIONBIO, &mode) == 0;
 #else
@@ -298,7 +307,7 @@ private:
     }
 
     static bool poll_fd(SocketHandle fd, int timeoutMs, bool forRead) {
-#ifdef _WIN32
+#ifdef TINYHTTPS_WINSOCK
         WSAPOLLFD pfd{};
         pfd.fd = fd;
         pfd.events = forRead ? POLLIN : POLLOUT;
@@ -314,7 +323,7 @@ private:
     }
 
     static void close_handle(SocketHandle fd) {
-#ifdef _WIN32
+#ifdef TINYHTTPS_WINSOCK
         ::closesocket(fd);
 #else
         ::close(fd);

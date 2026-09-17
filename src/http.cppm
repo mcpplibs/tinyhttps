@@ -786,7 +786,7 @@ static bool drain_body(TlsSocket& sock, const ResponseHead& head,
 // calling `keep()` drops the connection, and a path added tomorrow is safe
 // before anyone reviews it.
 //
-// ⚠️ Ordering: `drop()` destroys a `TlsSocket`, which sends `close_notify`,
+// Ordering: `drop()` destroys a `TlsSocket`, which sends `close_notify`,
 // which writes to a socket whose peer may be gone. That write is why P0 —
 // `MSG_NOSIGNAL` in `Socket::write` — had to land before this class existed;
 // without it, making the drop path more common would have made issue #16 more
@@ -808,7 +808,7 @@ public:
     // Drop now rather than at the end of the scope. Idempotent, and a no-op
     // after `keep()`.
     //
-    // ⚠️ Callers that recurse — the redirect paths — MUST settle the guard
+    // Callers that recurse — the redirect paths — MUST settle the guard
     // before recursing. The inner call puts its own connection into the pool
     // under the same key when the redirect is to the same host, and a guard
     // still armed when the outer scope ends would then delete it.

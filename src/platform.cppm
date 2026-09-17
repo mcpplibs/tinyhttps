@@ -1,6 +1,15 @@
 module;
 
-#ifndef _WIN32
+// The socket interface is chosen by the C library, not by the operating
+// system. On Windows with the platform's own C runtime it is Windows Sockets;
+// where the C library is POSIX-shaped (openkal-musl, selected in mcpp.toml by
+// `cfg(c-abi = "musl")`) it is the POSIX interface on every system, Windows
+// included.
+#if defined(_WIN32) && !defined(TINYHTTPS_POSIX_SOCKETS)
+#define TINYHTTPS_WINSOCK 1
+#endif
+
+#ifndef TINYHTTPS_WINSOCK
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <netdb.h>
@@ -14,7 +23,7 @@ import std;
 
 // mcpplibs.tinyhttps:platform — the one place OS-specific networking quirks
 // live. Everything else (socket.cppm, http.cppm…) stays portable and branches
-// on `platform::is_windows` with `if constexpr`, never raw #ifdef.
+// on `platform::uses_winsock` with `if constexpr`, never raw #ifdef.
 //
 // ── The platforms this library is known to run on, and what differs ──────────
 //
@@ -26,7 +35,7 @@ import std;
 // | Windows           | nothing to do            | no SIGPIPE, neither macro  |
 // | above openkal     | MSG_NOSIGNAL, and moot   | see below                  |
 //
-// ⭐ ABOVE openkal there are no signals at all, so the hazard issue #16
+// ABOVE openkal there are no signals at all, so the hazard issue #16
 // describes cannot arise — and the same code is nevertheless correct there
 // without a branch. openkal-musl defines MSG_NOSIGNAL
 // (`musl/include/sys/socket.h:344`) and accepts it as a no-op, in its own words:
@@ -36,7 +45,7 @@ import std;
 // -ENOSYS (`:550`, `:592-593`). SO_NOSIGPIPE is a BSD spelling that musl does
 // not define, so `socket.cppm`'s `#ifdef` for it simply does not compile in.
 //
-// ⚠️ One difference that IS live above openkal: connect() completes before it
+// One difference that IS live above openkal: connect() completes before it
 // returns even on a non-blocking descriptor, because `kal_net_connect` has no
 // form that begins a connection and reports its outcome later
 // (`port/src/okm_net.c:454-467`). `Socket::connect_addrinfo` therefore never
@@ -58,14 +67,14 @@ import std;
 namespace mcpplibs::tinyhttps::platform {
 
 // Compile-time platform flag for `if constexpr` at call sites.
-export inline constexpr bool is_windows =
-#ifdef _WIN32
+export inline constexpr bool uses_winsock =
+#ifdef TINYHTTPS_WINSOCK
     true;
 #else
     false;
 #endif
 
-#ifndef _WIN32
+#ifndef TINYHTTPS_WINSOCK
 
 namespace {
 
@@ -185,7 +194,7 @@ inline std::vector<std::string> dns_query_a(const std::string& server, const cha
 
 } // anonymous namespace
 
-#endif // !_WIN32
+#endif // !TINYHTTPS_WINSOCK
 
 // True when libc's own resolver has a usable config (/etc/resolv.conf). When
 // false, callers should prefer resolve_fallback() to avoid a multi-second stall
@@ -195,9 +204,9 @@ inline std::vector<std::string> dns_query_a(const std::string& server, const cha
 // `if constexpr` still compiles its discarded branch, which would reference the
 // POSIX-only helpers above that don't exist on Windows. Concentrating that
 // preprocessor divergence here is exactly why this platform module exists; call
-// sites elsewhere branch on `is_windows` with `if constexpr`.
+// sites elsewhere branch on `uses_winsock` with `if constexpr`.
 export bool system_resolver_configured() {
-#ifdef _WIN32
+#ifdef TINYHTTPS_WINSOCK
     return true;
 #else
     std::error_code ec;
@@ -211,7 +220,7 @@ export bool system_resolver_configured() {
 // on query failure. A numeric host is returned unchanged.
 export std::vector<std::string> resolve_fallback([[maybe_unused]] const char* host,
                                                  [[maybe_unused]] int timeoutMs) {
-#ifdef _WIN32
+#ifdef TINYHTTPS_WINSOCK
     return {};
 #else
     if (is_numeric_host(host)) return { std::string(host) };
