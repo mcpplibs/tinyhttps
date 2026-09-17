@@ -7,9 +7,9 @@
 | 关联 issue | [#15](https://github.com/mcpplibs/tinyhttps/issues/15) 连接池污染 · [#16](https://github.com/mcpplibs/tinyhttps/issues/16) SIGPIPE |
 | 文档日期 | 2026-09-06 |
 
-> ⚠️ **动手前先 `git pull`。** 当前工作区在 `626c9d0`(0.2.8),落后 origin/master 两个提交(`965d805` #9、`2cec1c1` #14)。本文所有行号对应 **0.2.10**;本地 `src/http.cppm` 只有 1032 行,对不上。
+> **动手前先 `git pull`。** 当前工作区在 `626c9d0`(0.2.8),落后 origin/master 两个提交(`965d805` #9、`2cec1c1` #14)。本文所有行号对应 **0.2.10**;本地 `src/http.cppm` 只有 1032 行,对不上。
 
-**标注约定**:✅ = 已逐行核验源码 · 🔬 = 已独立复现 · ⚠️ = 推断,未实测
+**标注约定**:= 已逐行核验源码 · = 已独立复现 · = 推断,未实测
 
 ---
 
@@ -34,20 +34,20 @@
 
 ## 1. 问题全景
 
-### 1.1 三个入口的加固覆盖矩阵 ✅
+### 1.1 三个入口的加固覆盖矩阵 
 
 库里有三份几乎平行的响应读取实现:`send_impl`、`send_stream`、`download_to_file_impl`。历次修复各自只落到其中一两份:
 
 | 加固措施 | 引入自 | `send_impl` | `send_stream` | `download_to_file_impl` |
 |---|---|---|---|---|
-| `parse_content_length`(严格) | #14 | ✅ `:516` | ✅ `:783` | ❌ `:1042-1048` 手写摘数字 |
-| `contentLength` 用 `int64_t` | — | ❌ `:488` **`int`** | ✅ `:756` | ✅ `:1024` |
-| `parse_chunk_size_line`(严格) | #9 | ❌ `:541` 仍是 `parse_hex` | ✅ `:831` | ✅ `:1134` |
-| `read_complete_line`(区分超时/EOF) | #9 | ❌ | ❌ | ✅ `:1118/1145/1177` |
-| 块后 CRLF 校验 | #9 | ❌ `:556` 丢弃返回值 | ❌ `:850` 丢弃返回值 | ✅ `:1177-1185` |
-| 状态行 `HTTP/` 前缀校验 | — | ❌ | ❌ | ❌ |
-| 早退时清理连接池 | — | ❌ 2 处 | ❌ 3 处 | ❌ **5 处** |
-| 失败时能告诉调用方 | — | ❌ 无字段 | ❌ 无字段 | ✅ `result.error` |
+| `parse_content_length`(严格) | #14 | `:516` | `:783` | `:1042-1048` 手写摘数字 |
+| `contentLength` 用 `int64_t` | — | `:488` **`int`** | `:756` | `:1024` |
+| `parse_chunk_size_line`(严格) | #9 | `:541` 仍是 `parse_hex` | `:831` | `:1134` |
+| `read_complete_line`(区分超时/EOF) | #9 | no | | `:1118/1145/1177` |
+| 块后 CRLF 校验 | #9 | `:556` 丢弃返回值 | `:850` 丢弃返回值 | `:1177-1185` |
+| 状态行 `HTTP/` 前缀校验 | — | no | | no |
+| 早退时清理连接池 | — | 2 处 | 3 处 | **5 处** |
+| 失败时能告诉调用方 | — | 无字段 | 无字段 | `result.error` |
 
 **这张表本身就是最强的论据**:每一次修复都是在一份拷贝上打补丁,另外两份继续带病。`#14` 引入 P1-A1/A2 两处新回归,正是这个模式的最新一次复发。**不做 P3,下一次还会有。**
 
@@ -66,7 +66,7 @@ R2/R3 是同一个毛病的两个实例:**用一个哨兵值(空串 / 0)表示�
 
 ## 2. P0 —— SIGPIPE(issue #16)
 
-### 2.1 判定 🔬
+### 2.1 判定 
 
 **真 bug,最高优先级。** 一个库在自己管理的 fd 上调 `send()`,却让宿主进程被 `SIGPIPE` 杀死(exit 141),是库的责任。
 
@@ -137,7 +137,7 @@ R2/R3 是同一个毛病的两个实例:**用一个哨兵值(空串 / 0)表示�
 
 **平台矩阵**:Linux/Android 走 `MSG_NOSIGNAL`;macOS/BSD 走 `SO_NOSIGPIPE`;Windows 两个宏都不存在 → 自动走 `#else`,且本来就没有 `SIGPIPE`,无需额外分支。`socket.cppm:8-9` 已经在非 Windows 下 include 了 `<sys/socket.h>`,两个宏都在里面,**不需要新增 include**。
 
-### 2.3 为什么这个修复是自包含的 ✅
+### 2.3 为什么这个修复是自包含的 
 
 失败会沿着**已经存在的**路径传播,零新增分支:
 
@@ -154,16 +154,16 @@ Socket::write → -1 (EPIPE)
 
 ## 3. P1 —— 连接池不变量(issue #15 + 4 处新发现)
 
-### 3.1 判定 ✅
+### 3.1 判定 
 
 **真 bug,不是使用方法错误。**
 
 | 报告者做的 | 是否合法 |
 |---|---|
-| 单个 `HttpClient` 跑多个请求 | ✅ 这正是连接池的用途 |
-| `keepAlive` 用默认值(true) | ✅ 库的默认值 |
-| `readTimeoutMs = 1000` | ✅ 激进但合法;**超时是正常事件,不是 API 误用** |
-| 触发条件:服务端发一半 / 空闲后关连接 | ✅ **服务端的常规行为** |
+| 单个 `HttpClient` 跑多个请求 | 这正是连接池的用途 |
+| `keepAlive` 用默认值(true) | 库的默认值 |
+| `readTimeoutMs = 1000` | 激进但合法;**超时是正常事件,不是 API 误用** |
+| 触发条件:服务端发一半 / 空闲后关连接 | **服务端的常规行为** |
 
 规避手段只有「关掉 keep-alive」或「每次换 client」—— 都是放弃这个特性本身。**用户无法在正确使用 API 的前提下绕开 → 定义上就是库的 bug。**
 
@@ -171,7 +171,7 @@ Socket::write → -1 (EPIPE)
 
 `connectionClose` 列 = 走到清理点时该标志的值。
 
-#### A. `send_stream` —— 🔴 **0.2.10 新引入的回归**
+#### A. `send_stream` —— **0.2.10 新引入的回归**
 
 | ID | 位置 | 触发 | 现状 | 修复 |
 |---|---|---|---|---|
@@ -179,7 +179,7 @@ Socket::write → -1 (EPIPE)
 | **A2** | `:884-885` | `read() <= 0` → `break` | `false` → 同上 | 设 `connectionClose = true` |
 | **A3** | `:846-848` | `read_exact` 失败 → `break` | `false` → 同上 | 设 `connectionClose = true` |
 
-**回归定位** ✅:`git log -S "A DECLARED LENGTH IS READ AND THE READER THEN STOPS"` → `2cec1c1` (#14)。0.2.3 的对应分支是:
+**回归定位** :`git log -S "A DECLARED LENGTH IS READ AND THE READER THEN STOPS"` → `2cec1c1` (#14)。0.2.3 的对应分支是:
 
 ```cpp
 } else {
@@ -209,13 +209,13 @@ B2 细节:`parse_hex`(`:233-243`)遇到不认识的字符是 `break` 返回**已
 |---|---|---|---|---|
 | **C1** | `:1166-1171` | chunk 数据 `read_exact` 失败 → **直接 return** | 跳过 `:1223` 尾声 | issue #15 |
 | **C2** | `:1195-1200` | CL body `read_exact` 失败 → **直接 return** | 同上 | issue #15 |
-| **C3** | `:1060-1075` | **重定向** | 🆕 **正常路径** | 本次发现 |
-| **C4** | `:1077-1081` | **非 2xx 返回** | 🆕 **正常路径** | 本次发现 |
-| **C5** | `:1092-1096` | 输出文件打不开 | 🆕 | 本次发现 |
+| **C3** | `:1060-1075` | **重定向** | **正常路径** | 本次发现 |
+| **C4** | `:1077-1081` | **非 2xx 返回** | **正常路径** | 本次发现 |
+| **C5** | `:1092-1096` | 输出文件打不开 | | 本次发现 |
 
 C1/C2 的对照:同一个函数里相邻的 `:1150-1153` 和 `:1180-1184` **写对了**(`sock->close(); pool_.erase(poolKey);`),这本身就证明是漏写而非取舍。
 
-##### 🆕 C3 是本次分析最值得注意的一条
+##### C3 是本次分析最值得注意的一条
 
 ```cpp
 1062:            // Drain any body to keep connection clean
@@ -239,7 +239,7 @@ C1/C2 的对照:同一个函数里相邻的 `:1150-1153` 和 `:1180-1184` **写�
 C4 同理:非 2xx 时 error body 未读就返回,socket 回池,同一 client 的下个请求中招。
 C5 同理:文件打不开时 body 未读。
 
-#### D. 🆕 整数截断
+#### D. 整数截断
 
 | ID | 位置 | 问题 |
 |---|---|---|
@@ -280,7 +280,7 @@ C5 同理:文件打不开时 body 未读。
 +                if (ret <= 0) { connectionClose = true; break; }
 ```
 
-> ✅ 已核验:`:909-912` 的清理本来就 key 在 `connectionClose || stopped` 上;正常终止路径(`remaining > 0` 循环条件自然结束、`:841` 终止块 break)**不经过**这三个出口。**成功路径零变化。**
+> 已核验:`:909-912` 的清理本来就 key 在 `connectionClose || stopped` 上;正常终止路径(`remaining > 0` 循环条件自然结束、`:841` 终止块 break)**不经过**这三个出口。**成功路径零变化。**
 
 #### P1-B `src/http.cppm` —— `send_impl` 两处
 
@@ -380,7 +380,7 @@ C3 / C4 / C5 —— 最小改法是**无条件丢弃连接**(见 P2-E1 有更省
          }
 ```
 
-> 📌 **review 决策点**:C3 用「无条件丢连接」换正确性,代价是每次重定向多一次 TLS 握手。若在意,P2-E1 提供一个有上限的 drain 助手,可把这三处改回「drain 成功就留、失败就丢」。**建议先合无条件版本(正确性优先),drain 作为后续优化。**
+> **review 决策点**:C3 用「无条件丢连接」换正确性,代价是每次重定向多一次 TLS 握手。若在意,P2-E1 提供一个有上限的 drain 助手,可把这三处改回「drain 成功就留、失败就丢」。**建议先合无条件版本(正确性优先),drain 作为后续优化。**
 
 #### P1-D `src/http.cppm:488` —— 类型对齐
 
@@ -399,7 +399,7 @@ C3 / C4 / C5 —— 最小改法是**无条件丢弃连接**(见 P2-E1 有更省
 
 > P2 的价值:**即使 P1 将来又出漏洞,残留字节也不会被伪装成一个合法响应。** #15 里最危险的两档(静默数据损坏)都会退化成可见错误。
 
-### P2-C1 状态行必须以 `HTTP/` 开头 ✅ 🆕
+### P2-C1 状态行必须以 `HTTP/` 开头 
 
 三个入口(`:456-484`、`:725`、`:1010-1020`)**都不校验前缀**,状态码提取还是「挑数字、静默跳过非数字」:
 
@@ -437,7 +437,7 @@ static std::optional<StatusLine> parse_status_line(std::string_view line) {
 
 三个入口统一改用它,失败一律 `pool_.erase` + `Invalid status line`。**导出它,理由和 `parse_chunk_size_line` 一样:这是 framing 里可以脱离服务端单测的那一半。**
 
-### P2-C2 header 循环区分「超时」与「真空行」✅
+### P2-C2 header 循环区分「超时」与「真空行」
 
 `:491-495` / `:758-762` / `:1030-1032` 三处都是:
 
@@ -452,11 +452,11 @@ if (headerLine.empty()) break;   // "End of headers"
 
 修复:三处都换成 `read_complete_line`(`:193-213`,返回 `expected`),`unexpected` → 明确报错并丢连接。**根因 R2 的正解,`#9` 已经写好了工具,只是没铺开。**
 
-### P2-C3 块后 CRLF 校验 ✅
+### P2-C3 块后 CRLF 校验 
 
 `send_impl:556` 和 `send_stream:850` 都是 `read_line(...)` 丢弃返回值;`download_to_file_impl:1177-1185` 是校验的(`"Missing CRLF after chunk data"`)。块长度算错时前两者会直接错位到下一个块头而不报错。照 download 的写法补齐。
 
-### P2-C4 `download_to_file_impl` 的 Content-Length 解析 ✅
+### P2-C4 `download_to_file_impl` 的 Content-Length 解析 
 
 `:1042-1048` 仍是手写摘数字循环:
 
@@ -482,14 +482,14 @@ static bool drain_body(TlsSocket& sock, bool chunked, std::int64_t contentLength
 
 有了它,C3/C4 可以写成 `if (!drain_body(...)) { sock->close(); pool_.erase(poolKey); }`。
 
-### P2-E2 分配上限(拒绝服务端诱导的巨额分配)🆕 ⚠️
+### P2-E2 分配上限(拒绝服务端诱导的巨额分配)
 
 - `send_impl:561` `response.body.resize(contentLength)` —— `contentLength` 最大到 `INT64_MAX`,`resize` 会抛 `std::length_error` / `std::bad_alloc`。**库没有文档说 `send()` 会抛异常**,调用方大概率没接。
 - `send_impl:549` / `send_stream:845` `std::string chunkData(chunkSize, '\0')` —— 服务端一个 `7fffffff` 块头就能让客户端分配 2 GiB。
 
 建议:加一个 `HttpClientConfig::maxResponseBodyBytes`(默认比如 64 MiB),超过就当作 framing 错误拒绝;chunk 数据改成按固定缓冲区分片读,不按块大小一次性分配。
 
-### P2-D1 `TlsSocket::read` 区分 EOF 与 would-block(根因 R3)✅
+### P2-D1 `TlsSocket::read` 区分 EOF 与 would-block(根因 R3)
 
 `tls.cppm:120-134`:`PEER_CLOSE_NOTIFY`、`ret == 0`、`WANT_READ`、`WANT_WRITE` **全部返回 0**。调用方(`read_exact:157`、`read_line:178`、`send_stream:885`)因此分不清「对端关了」和「暂时没数据」,只好用「等一下再试一次」的土办法遮盖。
 
@@ -501,9 +501,9 @@ enum class ReadStatus { Data, WouldBlock, Eof, Error };
 
 或保留 `int` 但用 `-2` 表示 would-block。
 
-> **与 P1 的关系**:P1-A2 把 `read() <= 0` 当成「流结束」丢连接。若那个 0 其实是瞬时 would-block,我们只是白丢一条连接 —— **正确性不受影响,只损失一点复用率**。所以 P1 不依赖 P2-D1,但修了 D1 之后 P1-A2 才精确。⚠️ 实践中 socket 在握手后被设回阻塞模式(`socket.cppm`),`WANT_*` 极少出现,影响应该很小,**未实测**。
+> **与 P1 的关系**:P1-A2 把 `read() <= 0` 当成「流结束」丢连接。若那个 0 其实是瞬时 would-block,我们只是白丢一条连接 —— **正确性不受影响,只损失一点复用率**。所以 P1 不依赖 P2-D1,但修了 D1 之后 P1-A2 才精确。实践中 socket 在握手后被设回阻塞模式(`socket.cppm`),`WANT_*` 极少出现,影响应该很小,**未实测**。
 
-### P2-D2 `write_all` 的 WANT_WRITE 处理 ✅ ⚠️
+### P2-D2 `write_all` 的 WANT_WRITE 处理 
 
 `http.cppm:216-230`:
 
@@ -516,9 +516,9 @@ if (ret == 0) {
 }
 ```
 
-`TlsSocket::write`(`tls.cppm:140-142`)在 `WANT_READ/WANT_WRITE` 时返回 0。所以 TLS 背压下会「忙重试一次然后放弃」→ 用户看到莫名其妙的 `"Write failed"`。应该改成 `wait_writable(timeoutMs)` 后重试,并给总时长设上限。⚠️ **未实测,按代码推断。**
+`TlsSocket::write`(`tls.cppm:140-142`)在 `WANT_READ/WANT_WRITE` 时返回 0。所以 TLS 背压下会「忙重试一次然后放弃」→ 用户看到莫名其妙的 `"Write failed"`。应该改成 `wait_writable(timeoutMs)` 后重试,并给总时长设上限。**未实测,按代码推断。**
 
-### P2-F1 🆕 调用方无法得知 body 被截断了(API 缺口)✅
+### P2-F1 调用方无法得知 body 被截断了(API 缺口)
 
 **这是 P1 修完之后剩下的最大问题。**
 
@@ -526,7 +526,7 @@ P1 只保证了「坏连接不会毒害下一个请求」,但当前请求返回�
 
 - `send_impl` CL 短读(`:562-565`)→ 返回真实的 `statusCode=200` + 半截 body,**没有任何截断标记**
 - `send_impl` / `send_stream` chunked 中断 → 同上
-- `DownloadToFileResult` **有** `error` 字段 ✅,`HttpResponse` **没有** ❌
+- `DownloadToFileResult` **有** `error` 字段 ,`HttpResponse` **没有** 
 
 也就是说:**一个被截断的 200 响应,和一个完整的 200 响应,调用方分不出来。**
 
@@ -554,9 +554,9 @@ export struct HttpResponse {
 
 在 P1 设 `connectionClose = true` 的每一处,同时设 `response.bodyComplete = false`。
 
-> 📌 **review 决策点**:(a) 只加 `bodyComplete` 字段、`ok()` 不变(建议,非破坏性);(b) 让 `ok()` 也要求 `bodyComplete`(更安全,但会让现有代码行为变化)。
+> **review 决策点**:(a) 只加 `bodyComplete` 字段、`ok()` 不变(建议,非破坏性);(b) 让 `ok()` 也要求 `bodyComplete`(更安全,但会让现有代码行为变化)。
 
-### P2-F2 🆕 `send_stream` 出错时会覆盖真实的 statusText ✅
+### P2-F2 `send_stream` 出错时会覆盖真实的 statusText 
 
 `:833` `response.statusText = "Invalid chunk size: " + sizeLine;` —— 把服务端真实的 `"OK"` 覆盖掉了。有了 P2-F1 的 `bodyComplete` 之后,应该改成保留 `statusText`,把原因放进新字段(或一个 `bodyError` 字符串)。
 
@@ -566,7 +566,7 @@ export struct HttpResponse {
 
 > P1 是逐条堵漏。**但 §1.1 的矩阵说明:这个 bug 类会随着每次新增代码复发。** `#14` 就是最新一次。P3 的目标是让它写不出来。
 
-### P3-A `PooledConn` —— 把默认行为从「留」翻成「丢」 ★ 最高性价比
+### P3-A `PooledConn` —— 把默认行为从「留」翻成「丢」 最高性价比
 
 当前所有 10 个 bug 的形状**完全一样**:一条早退路径**什么都没做**,而「什么都没做」的默认结果是**把脏连接留在池里**。
 
@@ -601,7 +601,7 @@ private:
 
 用法:每个入口开头建一个,只在 body **正常读完**的那唯一一处调 `keep()`。10 个 bug 一次全消,而且以后新增任何早退路径**天然安全**。
 
-> ⚠️ **两个必须注意的陷阱(review 重点)**:
+> **两个必须注意的陷阱(review 重点)**:
 >
 > 1. **递归重定向**。`send_impl:612` `return send_impl(redirectReq, redirectCount + 1);` 发生在 guard 析构**之前**。若重定向到同一 host,内层调用会往池里放一条新连接,外层 guard 析构时会把它**误删**。
 >    → 递归前必须先 `guard.keep()` 或 `guard.release()`。`download_to_file_impl:1073` 同理。
@@ -630,7 +630,7 @@ static BodyEnd read_body(TlsSocket&, const ResponseHead&, int timeoutMs,
 
 ### P3-C 带缓冲的读
 
-`read_line` 现在是逐字节 `sock.read(&c, 1)`。除了慢(⚠️ 影响有限:`TlsSocket::wait_readable` 会先查 `mbedtls_ssl_get_bytes_avail`,所以并不是每字节一次 `poll()`,主要成本是每字节一次函数调用 —— **未做基准测试,不要当成性能修复来卖**),更重要的是:
+`read_line` 现在是逐字节 `sock.read(&c, 1)`。除了慢(影响有限:`TlsSocket::wait_readable` 会先查 `mbedtls_ssl_get_bytes_avail`,所以并不是每字节一次 `poll()`,主要成本是每字节一次函数调用 —— **未做基准测试,不要当成性能修复来卖**),更重要的是:
 
 **一个显式的读缓冲,才能让「这条连接干净吗」这个问题真正可回答**(= 缓冲区空 + body 已按 framing 读完)。现在这个问题只能靠人肉追踪 10 条路径。这是 P3-C 的主要理由,性能是副产品。
 
@@ -655,20 +655,20 @@ P0+P1 只是把「进程被杀」降级成「一个莫名其妙的 `No response`
     丢弃连接 → 新建连接 → 重发一次(仅一次)
 ```
 
-> 📌 **review 决策点 —— 要不要限制到幂等方法?**
+> **review 决策点 —— 要不要限制到幂等方法?**
 >
 > - Go 的策略保守:只重试幂等方法(GET/HEAD/OPTIONS/TRACE)或带 `Idempotency-Key` 的请求。
 > - curl 的策略宽松:只要连接是复用的就重试,不看方法。
 >
 > **我倾向 curl 的做法**,理由:(1) tinyhttps 的主力场景是 LLM / API 客户端,POST 是绝对多数,限制到幂等方法等于这个修复基本没用;(2) 重试窗口极窄 —— 只在**一个响应字节都没收到**时才重试,此时服务端已经发过 FIN,应用层根本没看到这个请求;(3) 加一个 `HttpClientConfig::retryOnStaleConnection`(默认 true)让保守用户能关掉。
 >
-> ⚠️ 残留风险:服务端「收到并处理了请求 → 还没回响应就崩了/关了」这种情况下会重复执行。窄,但非零。**这一条请你拍板。**
+> 残留风险:服务端「收到并处理了请求 → 还没回响应就崩了/关了」这种情况下会重复执行。窄,但非零。**这一条请你拍板。**
 
 ---
 
 ## 6. 测试方案
 
-### 6.1 现状 ✅
+### 6.1 现状 
 
 `tests/` 下只有 `test_download.cpp` 和 `test_resolver.cpp`,**零 keep-alive / 连接复用覆盖** —— 这就是 `#14` 的回归能全绿合进来的直接原因。
 
@@ -679,7 +679,7 @@ P0+P1 只是把「进程被杀」降级成「一个莫名其妙的 `No response`
 | # | 用例 | 断言 | 覆盖 |
 |---|---|---|---|
 | T1 | 服务端发一半 CL body 后挂住 | 请求 2 `statusCode == 200`(不是 999/0/Invalid) | A1 |
-| T2 | **同上,并断言服务端 TCP 连接数 == 2** | 🔴 **唯一能抓住「50 个 B」那种「看起来对了」的 case 的断言** | A1 |
+| T2 | **同上,并断言服务端 TCP 连接数 == 2** | **唯一能抓住「50 个 B」那种「看起来对了」的 case 的断言** | A1 |
 | T3 | chunked 版本同上 | 同 T1 + T2 | A3 |
 | T4 | 服务端发一半后关连接 | 请求 2 不崩 + 断言**进程未被信号杀死** | #16 |
 | T5 | **`SIGPIPE` 保持默认处置**跑 T4(子进程) | `WIFSIGNALED == false`,退出码 != 141 | P0 |
@@ -759,13 +759,13 @@ gcc -o sigpipe_probe sigpipe_probe.c && ./sigpipe_probe
 | P1-B2 | P1 | `http.cppm:541` | `parse_hex` → `parse_chunk_size_line`(并删除 `parse_hex`) |
 | P1-C1 | P1 | `http.cppm:1166-1171` | download chunk 短读 → `close + erase` |
 | P1-C2 | P1 | `http.cppm:1195-1200` | download CL 短读 → `close + erase` |
-| P1-C3 | P1 | `http.cppm:1060-1075` | 🆕 **重定向未 drain body** |
-| P1-C4 | P1 | `http.cppm:1077-1081` | 🆕 非 2xx 未 drain body |
-| P1-C5 | P1 | `http.cppm:1092-1096` | 🆕 文件打开失败未 drain body |
-| P1-D1 | P1 | `http.cppm:488` | 🆕 `int contentLength` → `int64_t`(整数截断) |
-| P2-C1 | P2 | 三处状态行 | 🆕 校验 `HTTP/` 前缀 + 严格状态码 |
+| P1-C3 | P1 | `http.cppm:1060-1075` | **重定向未 drain body** |
+| P1-C4 | P1 | `http.cppm:1077-1081` | 非 2xx 未 drain body |
+| P1-C5 | P1 | `http.cppm:1092-1096` | 文件打开失败未 drain body |
+| P1-D1 | P1 | `http.cppm:488` | `int contentLength` → `int64_t`(整数截断) |
+| P2-C1 | P2 | 三处状态行 | 校验 `HTTP/` 前缀 + 严格状态码 |
 | P2-C2 | P2 | 三处 header 循环 | 用 `read_complete_line` 区分超时/空行 |
 | P2-C3 | P2 | `:556` `:850` | 校验块后 CRLF |
 | P2-C4 | P2 | `:1042-1048` | download 换 `parse_content_length` |
-| P2-E2 | P2 | `:561` `:549` `:845` | 🆕 分配上限,防 2 GiB 分配 / 未文档化的异常 |
-| P2-F1 | P2 | `HttpResponse` | 🆕 加 `bodyComplete` —— 调用方现在无法得知 body 被截断 |
+| P2-E2 | P2 | `:561` `:549` `:845` | 分配上限,防 2 GiB 分配 / 未文档化的异常 |
+| P2-F1 | P2 | `HttpResponse` | 加 `bodyComplete` —— 调用方现在无法得知 body 被截断 |

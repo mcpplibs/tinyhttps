@@ -13,7 +13,16 @@
 #include <gtest/gtest.h>
 #include "tls_test_server.hpp"
 
-#ifndef _WIN32
+// The socket interface is chosen by the C library, not by the operating
+// system. On Windows with the platform's own C runtime it is Windows Sockets;
+// where the C library is POSIX-shaped (openkal-musl, selected in mcpp.toml by
+// `cfg(c-abi = "musl")`) it is the POSIX interface on every system, Windows
+// included.
+#if defined(_WIN32) && !defined(TINYHTTPS_POSIX_SOCKETS)
+#define TINYHTTPS_WINSOCK 1
+#endif
+
+#ifndef TINYHTTPS_WINSOCK
 #include <csignal>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -56,7 +65,7 @@ protected:
 // does. The read times out with 50 bytes still owed, and those 50 bytes then
 // arrive on a socket nobody is reading.
 //
-// ⚠️ THE LATE SECOND HALF IS WHAT MAKES THIS A TEST. An earlier form of this
+// THE LATE SECOND HALF IS WHAT MAKES THIS A TEST. An earlier form of this
 // server stalled and never sent the rest; the connection was then silent rather
 // than dirty, and the stale-connection retry rescued the second request whether
 // or not the pool guard worked. Verified by mutation: with the guard's
@@ -719,7 +728,7 @@ TEST_F(PoolTest, AnEndlessTrailerSectionIsRefused) {
 
 // ── issue #16 · SIGPIPE ──────────────────────────────────────────────────────
 
-#ifndef _WIN32
+#ifndef TINYHTTPS_WINSOCK
 // THE TEST HAS TO FORK, AND THE REASON IS ITSELF EVIDENCE.
 //
 // `mbedtls_net_bind` calls `net_prepare`, which does `signal(SIGPIPE, SIG_IGN)`
@@ -801,4 +810,4 @@ TEST(SigPipe, WritingToADepartedPeerReturnsInsteadOfKillingTheProcess) {
     EXPECT_EQ(WEXITSTATUS(status), 0)
         << "child exit code 3 = could not connect, 4 = the write never failed";
 }
-#endif // !_WIN32
+#endif // !TINYHTTPS_WINSOCK

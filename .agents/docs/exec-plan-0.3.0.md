@@ -20,8 +20,8 @@
 版本取 **0.3.0** 而不是 0.2.11:`HttpResponse` / `HttpClientConfig` 加了字段(非破坏),严格解析会把过去静默接受的畸形响应变成显式错误(**行为变更**)。语义化版本下,行为变更进 minor。
 
 **无感升级的边界**(release note 必须点名):
-- ✅ 现有代码**不需要改一行**就能编译:只加字段,不改签名,`ok()` 语义不变。
-- ⚠️ 过去被静默接受的畸形响应现在会报错 —— 这不是新 bug,是过去在静默损坏数据。
+- 现有代码**不需要改一行**就能编译:只加字段,不改签名,`ok()` 语义不变。
+- 过去被静默接受的畸形响应现在会报错 —— 这不是新 bug,是过去在静默损坏数据。
 
 ---
 
@@ -45,7 +45,7 @@
 ```
 T0  分支 + 计划                                    ✔
  │
- ├─ T1  P0 SIGPIPE（socket.cppm）  ★ 必须最先
+ ├─ T1  P0 SIGPIPE（socket.cppm）  必须最先
  │   │   P0-1 send() + MSG_NOSIGNAL
  │   │   P0-2 socket() 后 setsockopt(SO_NOSIGPIPE)
  │   │   理由：T5 让 pool_.erase() 在更多路径上执行，
@@ -66,7 +66,7 @@ T0  分支 + 计划                                    ✔
  │            └ 吸收 P2-E2（分配上限，chunk 分片读）
  │           │
  │           ├─ T4  P3-A PooledConnection（默认丢弃）← 吸收 P1-A/B/C 全部十项
- │           │   │   ⚠ 递归重定向：递归前必须 keep() 或 drop()，不能让析构跨过递归
+ │           │   │   递归重定向：递归前必须 keep() 或 drop()，不能让析构跨过递归
  │           │   │
  │           │   ├─ T5  P2-E1 bounded drain（重定向/非 2xx/文件打不开时省一次握手）
  │           │   ├─ T6  P2-F1/F2 bodyComplete + bodyError（statusText 不再被覆盖）
@@ -75,7 +75,7 @@ T0  分支 + 计划                                    ✔
  │           └─ T8  纯单测：parse_status_line / parse_chunk_size_line / parse_content_length
  │
  ├─ T9  集成测试:进程内 mbedtls TLS listener（T4 后）
- │       ⚠ tinyhttps 只支持 https，本地明文 listener 用不了 → 必须自带 TLS 服务端
+ │       tinyhttps 只支持 https，本地明文 listener 用不了 → 必须自带 TLS 服务端
  │       T1..T11 用例见 §4
  │
  ├─ T10 openkal 体系(与 T1..T9 并行调研,结论落地在 T1/platform.cppm)
@@ -136,7 +136,7 @@ T0  分支 + 计划                                    ✔
 | # | 用例 | 断言 | 覆盖 |
 |---|---|---|---|
 | T1 | 服务端发一半 CL body 后挂住 | 请求 2 `statusCode == 200` | P1-A1 |
-| T2 | 同上,**并断言服务端 accept 次数 == 2** | 🔴 唯一能抓住「看起来对了」的断言 | P1-A1 |
+| T2 | 同上,**并断言服务端 accept 次数 == 2** | 唯一能抓住「看起来对了」的断言 | P1-A1 |
 | T3 | chunked 版本同上 | 同 T1+T2 | P1-A3 |
 | T4 | 服务端发一半后关连接 | 不崩;进程未被信号杀死 | #16 |
 | T5 | `SIGPIPE` 默认处置下跑 T4(子进程) | `WIFSIGNALED == false`,退出码 ≠ 141 | P0 |
