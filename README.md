@@ -121,7 +121,7 @@ mcpp add tinyhttps@0.3.0
 
 ```toml
 [dependencies]
-tinyhttps = "0.3.0"
+tinyhttps = "0.3.1"
 ```
 
 ### 构建
