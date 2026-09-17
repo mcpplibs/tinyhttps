@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.3.1
+
+The socket interface is selected by the C library rather than by the operating
+system ([mcpp-index#435](https://github.com/mcpplibs/mcpp-index/issues/435)).
+Above openkal on Windows the C library is musl and `winsock2.h` is not in the
+dependency graph; the POSIX interface is used there, selected in `mcpp.toml` by
+`cfg(c-abi = "musl")`. A Windows build with the platform's C runtime is
+unchanged. `platform::is_windows` is renamed `platform::uses_winsock`.
+
 ## 0.3.0
 
 Closes [#15](https://github.com/mcpplibs/tinyhttps/issues/15) (a socket returned
