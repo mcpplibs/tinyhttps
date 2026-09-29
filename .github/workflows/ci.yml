@@ -31,7 +31,7 @@ on:
   workflow_dispatch:
 
 env:
-  MCPP_VERSION: 2026.8.29.1
+  MCPP_VERSION: 2026.9.28.3
   XLINGS_VERSION: v2026.8.17.2
   XLINGS_NON_INTERACTIVE: '1'
 
