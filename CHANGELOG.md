@@ -1,5 +1,35 @@
 # Changelog
 
+## 0.3.2
+
+`download_to_file` no longer reports success for a file the disk did not keep.
+
+It called `ofs.write` for each body chunk without looking at the stream, added
+each chunk's size to `bytesWritten` from what the network delivered, and set
+`bytesWritten` after `ofs.close()` without looking at that either. On a full disk
+(`ENOSPC`) the transfer therefore succeeded: a 420,831,054 byte download left
+220,979,200 bytes on disk while `bytesWritten` said 420,831,054 and `ok()` was
+true, and the caller blamed the source (a checksum mismatch) for what was the
+local disk.
+
+* Each chunk is flushed and the stream checked. On the first failure the
+  transfer stops reading, `error` becomes `write <path>: <reason>` (the reason
+  is `errno` as `std::generic_category` words it, for example `No space left on
+  device`), and the connection is dropped rather than returned to the pool with
+  the rest of the body still on it. Closing the file is checked the same way.
+* `DownloadToFileResult::writeFailed` is new and is true when the fault is the
+  destination rather than the source: the write failed, the close failed, or the
+  file could not be opened (`error` is still `Cannot open file: <path>` for the
+  last).
+* `DownloadToFileResult::bytesReceived` is new: the bytes of body the
+  connection delivered.
+* `DownloadToFileResult::bytesWritten` changes meaning, and this is the one
+  behaviour change: it now counts bytes the file accepted, where it used to
+  count bytes the network delivered. The two are equal for every transfer that
+  did not fail to write. When a write fails, the chunk that failed is not
+  counted, though the file may hold part of it, so the value is a floor on the
+  file's size.
+
 ## 0.3.1
 
 The socket interface is selected by the C library rather than by the operating
