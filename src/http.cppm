@@ -1,3 +1,9 @@
+module;
+
+// `import std` carries no `errno`: it is a macro, and a module does not export
+// macros. The download path reads it to say why the local file refused a write.
+#include <cerrno>
+
 export module mcpplibs.tinyhttps:http;
 
 import :tls;
@@ -105,11 +111,39 @@ export using DownloadProgressFn = std::function<void(std::int64_t total, std::in
 export struct DownloadToFileResult {
     int statusCode { 0 };
     std::string error;
+
+    // Bytes that reached the destination file: the sum of the body chunks whose
+    // write the stream accepted. It is a statement about the file and not about
+    // the network, which is `bytesReceived`.
+    //
+    // It used to be the network count. On a full disk every write after the
+    // first failure was discarded while this kept rising, so a 420,831,054 byte
+    // download that left 220,979,200 bytes on disk reported 420,831,054 and
+    // `ok()`. When a write fails, the chunk that failed is not counted, though
+    // the file may hold part of it; the value is a floor on the file's size and
+    // never above it.
     std::int64_t bytesWritten { 0 };
+
     std::optional<std::int64_t> expectedBytes;
     std::string finalUrl;
     std::string etag;
     std::string lastModified;
+
+    // Bytes of body the connection delivered, whether or not the file took them.
+    // Equal to `bytesWritten` unless `writeFailed`.
+    std::int64_t bytesReceived { 0 };
+
+    // TRUE WHEN THE FAULT IS THE DESTINATION AND NOT THE SOURCE — the file could
+    // not be opened, a write to it failed (a full disk, a quota, a device that
+    // refuses), or closing it reported that buffered data did not reach it.
+    //
+    // `error` then names the path and the reason, and the transfer stops at the
+    // first failure instead of reading on and discarding what it reads. It is
+    // what lets a caller tell "the server sent something wrong" from "this
+    // machine could not keep it" without matching text in `error`; a checksum
+    // failure downstream of a truncated file otherwise blames the wrong party.
+    bool writeFailed { false };
+
     bool ok() const { return statusCode >= 200 && statusCode < 300 && error.empty(); }
 };
 
@@ -1222,34 +1256,82 @@ private:
         std::ofstream ofs(destFile, std::ios::binary);
         if (!ofs) {
             result.error = "Cannot open file: " + destFile.string();
+            result.writeFailed = true;
             settle_without_body(exchange, hasBody, guard);
             return result;
         }
 
-        if (!hasBody) {
+        // What the file refused, in the words of the system that refused it.
+        // `errno` is cleared before each operation that can set it, because the
+        // socket reads between writes leave their own values behind and a stale
+        // EAGAIN reported as the reason a disk filled is worse than no reason.
+        int writeErrno = 0;
+        bool writeFailed = false;
+        auto close_file = [&] {
+            errno = 0;
             ofs.close();
+            if (!writeFailed && ofs.fail()) {
+                writeFailed = true;
+                writeErrno = errno;
+            }
+        };
+        auto write_failure = [&] {
+            return "write " + destFile.string() + ": " +
+                   (writeErrno != 0
+                        ? std::generic_category().message(writeErrno)
+                        : std::string("stream error"));
+        };
+
+        if (!hasBody) {
+            close_file();
+            if (writeFailed) {
+                result.error = write_failure();
+                result.writeFailed = true;
+                return result;
+            }
             if (config_.keepAlive && !exchange.head.connectionClose) guard.keep();
             return result;
         }
 
         const std::int64_t totalBytes =
             exchange.head.contentLength > 0 ? exchange.head.contentLength : 0;
-        std::int64_t downloaded = 0;
+        std::int64_t received = 0;
+        std::int64_t written = 0;
         bool cancelled = false;
 
         auto outcome = read_body(
             *exchange.sock, exchange.head, config_.readTimeoutMs,
             std::numeric_limits<std::int64_t>::max(),
             [&](std::string_view data) -> bool {
+                const auto size = static_cast<std::int64_t>(data.size());
+                received += size;
+
+                // Flushed per chunk, and the stream checked after it. A write
+                // into the stream's buffer succeeds whatever the disk has left;
+                // the failure surfaces at the flush that hands the buffer to the
+                // operating system, and without one here it surfaced at
+                // `close()`, after every chunk had been counted as written.
+                // `read_body` hands over slices of at most 8 KiB, about the size
+                // of the stream's own buffer, so this costs no more system calls
+                // than the buffering it replaces.
+                errno = 0;
                 ofs.write(data.data(), static_cast<std::streamsize>(data.size()));
-                downloaded += static_cast<std::int64_t>(data.size());
-                if (onProgress) onProgress(totalBytes, downloaded);
+                ofs.flush();
+                if (!ofs) {
+                    writeFailed = true;
+                    writeErrno = errno;
+                    return false;   // reading on would only discard what it reads
+                }
+
+                written += size;
+                if (onProgress) onProgress(totalBytes, written);
                 if (isCancelled && isCancelled()) { cancelled = true; return false; }
                 return true;
             });
 
-        ofs.close();
-        result.bytesWritten = downloaded;
+        close_file();
+        result.bytesWritten = written;
+        result.bytesReceived = received;
 
         switch (outcome.end) {
             case BodyEnd::Complete:
@@ -1263,6 +1345,14 @@ private:
             case BodyEnd::Truncated:
                 result.error = outcome.error;
                 break;
+        }
+
+        // The destination's failure outranks whatever the switch recorded: a
+        // stop that the file asked for is not a cancellation, and a body that
+        // arrived whole into a file that lost it has not succeeded.
+        if (writeFailed) {
+            result.error = write_failure();
+            result.writeFailed = true;
         }
         return result;
     }

@@ -624,6 +624,94 @@ TEST_F(PoolTest, ADownloadDelimitedByTheCloseReportsSuccess) {
     std::filesystem::remove_all(dir, ec);
 }
 
+// ── a destination that refuses the bytes ─────────────────────────────────────
+
+// `/dev/full` accepts an open and answers every write with ENOSPC, which is what
+// a full disk does at the moment it fills — without needing one.
+//
+// Before 0.3.2 the transfer "succeeded": `ofs.write` was never checked, the
+// count came from the network, and `bytesWritten` said the whole body when the
+// file held none of it. The caller then blamed the source (a checksum mismatch)
+// for what was the local disk. Verified by mutation: with the stream check
+// removed, `ok()` is true and `bytesWritten` is the body's length.
+#ifdef __linux__
+TEST_F(PoolTest, ADownloadIntoAFullDeviceFailsAsALocalWriteAndCountsNothing) {
+    if (!std::filesystem::exists("/dev/full")) GTEST_SKIP() << "no /dev/full";
+
+    const std::string payload(64 * 1024, 'F');
+    tls_test::Server server([payload](tls_test::Conn& conn, int) {
+        conn.write(tls_test::ok_response(payload));
+        return true;
+    });
+    ASSERT_FALSE(server.failed());
+
+    https::HttpClient client(test_config());
+    auto result = client.download_to_file(server.url("/big"), "/dev/full");
+
+    EXPECT_FALSE(result.ok()) << "a file that took nothing was reported as downloaded";
+    EXPECT_TRUE(result.writeFailed)
+        << "the caller must be able to tell the disk from the source; error: "
+        << result.error;
+    EXPECT_EQ(result.statusCode, 200);
+    EXPECT_EQ(result.bytesWritten, 0);
+    EXPECT_GT(result.bytesReceived, 0);
+    EXPECT_LT(result.bytesReceived, static_cast<std::int64_t>(payload.size()))
+        << "the transfer read on after the first refused write";
+    EXPECT_EQ(result.error.rfind("write /dev/full: ", 0), 0u) << result.error;
+    EXPECT_NE(result.error.find(
+                  std::make_error_code(std::errc::no_space_on_device).message()),
+              std::string::npos)
+        << result.error;
+
+    // The rest of the body was left on the socket, so the connection is not
+    // handed to the next request. The next request also shows the client is
+    // not left in a state where a good destination fails too.
+    auto dir = std::filesystem::temp_directory_path() / "tinyhttps_pool_full";
+    std::filesystem::create_directories(dir);
+    auto dest = dir / "ok.bin";
+    auto good = client.download_to_file(server.url("/big"), dest);
+    EXPECT_TRUE(good.ok()) << "error: " << good.error;
+    EXPECT_FALSE(good.writeFailed);
+    EXPECT_EQ(good.bytesWritten, static_cast<std::int64_t>(payload.size()));
+    EXPECT_EQ(good.bytesReceived, good.bytesWritten);
+    EXPECT_EQ(server.accepts(), 2)
+        << "the connection with an unread body was reused";
+
+    std::error_code ec;
+    std::filesystem::remove_all(dir, ec);
+}
+#endif
+
+// A destination that cannot be opened is the same kind of failure: nothing was
+// wrong with what the server sent.
+TEST_F(PoolTest, ADestinationThatCannotBeOpenedIsALocalFailure) {
+    tls_test::Server server([](tls_test::Conn& conn, int) {
+        conn.write(tls_test::ok_response("payload"));
+        return true;
+    });
+    ASSERT_FALSE(server.failed());
+
+    auto dir = std::filesystem::temp_directory_path() / "tinyhttps_pool_noopen";
+    std::filesystem::create_directories(dir);
+    {
+        // A regular file where a directory is needed: no parent can be made.
+        std::ofstream blocker(dir / "blocker", std::ios::binary);
+        blocker << "not a directory";
+    }
+
+    https::HttpClient client(test_config());
+    auto result = client.download_to_file(server.url("/x"),
+                                          dir / "blocker" / "out.bin");
+
+    EXPECT_FALSE(result.ok());
+    EXPECT_TRUE(result.writeFailed) << "error: " << result.error;
+    EXPECT_EQ(result.error.rfind("Cannot open file: ", 0), 0u) << result.error;
+    EXPECT_EQ(result.bytesWritten, 0);
+
+    std::error_code ec;
+    std::filesystem::remove_all(dir, ec);
+}
+
 // ── interim responses ────────────────────────────────────────────────────────
 
 // A 1xx is not the answer. RFC 9112 §2.1 requires a client to read past one or
