@@ -114,14 +114,14 @@ cd examples/openkal && mcpp run
 ### 添加依赖
 
 ```bash
-mcpp add tinyhttps@0.3.0
+mcpp add tinyhttps@0.3.2
 ```
 
 或在 `mcpp.toml` 中手动添加：
 
 ```toml
 [dependencies]
-tinyhttps = "0.3.1"
+tinyhttps = "0.3.2"
 ```
 
 ### 构建
@@ -140,7 +140,10 @@ mcpplibs::tinyhttps::HttpClient client;
 auto result = client.download_to_file(
     "https://example.com/big.tar.gz", "out/big.tar.gz",
     [](std::int64_t total, std::int64_t done) { /* progress */ });
-if (!result.ok()) { /* result.error */ }
+if (!result.ok()) {
+    // result.error says why; result.writeFailed says the local file is at
+    // fault (a full disk, a refused write) and not the server.
+}
 ```
 
 ## License
