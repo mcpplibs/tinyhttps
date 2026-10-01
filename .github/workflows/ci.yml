@@ -232,11 +232,10 @@ jobs:
       # takes the stack beneath it from the index, so what is tested is this
       # commit against the published openkal packages.
       #
-      # The toolchain is named, as mcpp-index's measurement names it. A fresh
-      # runner's default is the gcc mcpp installed first, and with it
-      # x86_64-windows-musl was refused as "cannot be built on this host" even
-      # though the example's own `[toolchain]` names llvm, the one the openkal
-      # runtime supplies that target for.
+      # The toolchain is named, as mcpp-index's measurement names it, and
+      # installed beforehand: on a fresh runner x86_64-windows-musl was refused
+      # as "cannot be built on this host" while llvm was not yet installed, though
+      # the Linux targets, which install it on demand, built.
       #
       # It cancels a handshake against a local listener, which needs no network,
       # and then makes one HTTPS request; it reports "no network" rather than
@@ -244,6 +243,9 @@ jobs:
       # instead of "broken". A certificate the client refused is a failure, not
       # an absence of network. The build, the link, the framing parsers and the
       # cancellation are checked either way.
+      - name: Install llvm
+        run: mcpp toolchain install llvm 22.1.8
+
       - name: Build and run above openkal
         if: matrix.target != 'x86_64-windows-musl'
         working-directory: examples/openkal
