@@ -351,8 +351,10 @@ export struct ProxyTunnel {
 // setting that governs the connection to the target.
 export ProxyTunnel proxy_tunnel(const ProxyConfig& proxy,
                                 std::string_view targetHost, int targetPort,
-                                int timeoutMs, bool verifySsl = true) {
+                                int timeoutMs, bool verifySsl = true,
+                                std::stop_token stop = {}) {
     ProxyTunnel tunnel;
+    tunnel.socket.set_stop(stop);
     const std::string where = proxy.host + ":" + std::to_string(proxy.port);
 
     if (proxy.scheme == "http" || proxy.scheme == "socks5" || proxy.scheme == "socks5h") {
@@ -366,6 +368,7 @@ export ProxyTunnel proxy_tunnel(const ProxyConfig& proxy,
         if (!tunnel.error.empty()) tunnel.socket.close();
     } else if (proxy.scheme == "https") {
         auto tls = std::make_unique<TlsSocket>();
+        tls->set_stop(stop);
         if (!tls->connect(proxy.host.c_str(), proxy.port, timeoutMs, verifySsl)) {
             // The session says why when the TCP connection was up, which is
             // where a proxy certificate that does not verify is refused.
@@ -385,11 +388,11 @@ export ProxyTunnel proxy_tunnel(const ProxyConfig& proxy,
 // say why it failed; `proxy_tunnel` can.
 export Socket proxy_connect(std::string_view proxyHost, int proxyPort,
                             std::string_view targetHost, int targetPort,
-                            int timeoutMs) {
+                            int timeoutMs, std::stop_token stop = {}) {
     ProxyConfig proxy;
     proxy.host = std::string(proxyHost);
     proxy.port = proxyPort;
-    auto tunnel = proxy_tunnel(proxy, targetHost, targetPort, timeoutMs);
+    auto tunnel = proxy_tunnel(proxy, targetHost, targetPort, timeoutMs, true, stop);
     return std::move(tunnel.socket);
 }
 

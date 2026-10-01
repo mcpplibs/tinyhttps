@@ -183,6 +183,10 @@ public:
     // is stopped or after `limit`.
     void park(std::chrono::milliseconds limit = std::chrono::seconds(20));
 
+    // Waits for the client to end the connection, discarding anything it sends.
+    // False when `limit` passes or the server is stopped first.
+    bool wait_peer_close(std::chrono::milliseconds limit = std::chrono::seconds(20));
+
     // Ends the connection at the TLS layer, then at the transport.
     void shutdown() {
         if (closed_) return;
@@ -501,6 +505,20 @@ inline void Conn::relay_to(int port, std::chrono::milliseconds gather) {
         }
     }
     mbedtls_net_free(&target);
+}
+
+inline bool Conn::wait_peer_close(std::chrono::milliseconds limit) {
+    const auto deadline = std::chrono::steady_clock::now() + limit;
+    unsigned char buf[256];
+    while (!server_.stopping() && std::chrono::steady_clock::now() < deadline) {
+        const int ready = mbedtls_net_poll(&net_, MBEDTLS_NET_POLL_READ, 50);
+        if (ready < 0) return true;
+        if (ready == 0) continue;
+        int ret = mbedtls_ssl_read(&ssl_, buf, sizeof buf);
+        if (ret == MBEDTLS_ERR_SSL_WANT_READ || ret == MBEDTLS_ERR_SSL_WANT_WRITE) continue;
+        if (ret <= 0) return true;
+    }
+    return false;
 }
 
 inline void Conn::park(std::chrono::milliseconds limit) {

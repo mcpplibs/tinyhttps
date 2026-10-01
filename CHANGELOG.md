@@ -1,5 +1,23 @@
 # Changelog
 
+## Unreleased
+
+`send` and `send_stream` take an optional `std::stop_token`, so another thread
+can abandon a request that is in flight.
+
+* When the token is stopped the call returns within about 50 ms with
+  `HttpResponse::cancelled` set, and the connection is closed instead of being
+  returned to the pool. It covers connect, the proxy CONNECT exchange, the TLS
+  handshake, waiting for the response head, reading the body and the gaps
+  between streaming callbacks.
+* Before the status line arrives the response is `statusCode` 0 with
+  `statusText` and `bodyError` `Cancelled`. After it, `statusCode` is the
+  server's and `bodyError` is `cancelled`. A cancelled request is not retried on
+  a new connection and its redirect is not followed.
+* Not covered: name resolution, and a write that is blocked because the server
+  is not reading. Without a token nothing changes.
+* `proxy_connect` takes the token as a trailing default argument.
+
 ## 0.3.3
 
 **Behaviour change, and the reason for this release:** `verifySsl = true` (the

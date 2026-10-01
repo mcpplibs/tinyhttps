@@ -79,6 +79,10 @@ static int bio_send(void* ctx, const unsigned char* buf, size_t len) {
 // complete and correct.
 static int bio_recv(void* ctx, unsigned char* buf, size_t len) {
     auto* sock = static_cast<Socket*>(ctx);
+    // With a stop token, wait here so the recv below cannot block past a stop.
+    if (sock->stop_possible() && !sock->wait_readable(-1)) {
+        return MBEDTLS_ERR_NET_RECV_FAILED;
+    }
     int ret = sock->read(reinterpret_cast<char*>(buf), static_cast<int>(len));
     if (ret < 0) {
         return MBEDTLS_ERR_NET_RECV_FAILED;
@@ -159,6 +163,9 @@ public:
     // Why the last connect_over/connect failed once the TCP connection was up;
     // empty if it failed earlier or has not failed.
     [[nodiscard]] const std::string& error() const { return error_; }
+
+    // Call before connect(); it covers the handshake and every later wait.
+    void set_stop(std::stop_token stop) { socket_.set_stop(std::move(stop)); }
 
     // Connect over an already-established Socket (e.g. a proxy tunnel).
     // Takes ownership of the socket and performs TLS handshake on top of it.

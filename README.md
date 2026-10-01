@@ -46,6 +46,24 @@ else                       { /* resp.body is all of it */ }
 `ok()` deliberately does not consult `bodyComplete`, so existing `if (res.ok())`
 means exactly what it did before.
 
+### Cancelling a request
+
+Pass a `std::stop_token` to `send` or `send_stream` and stop its source from
+another thread. The call returns within about 50 ms with `cancelled` set, and
+the connection is closed rather than pooled.
+
+```cpp
+std::stop_source source;
+auto worker = std::jthread([&] { response = client.send(request, source.get_token()); });
+// elsewhere:
+source.request_stop();
+```
+
+If the status line had not arrived, `statusCode` is 0 and `statusText` is
+`Cancelled`; otherwise they are the server's and `bodyError` is `cancelled`.
+Name resolution and a write blocked on a server that is not reading cannot be
+interrupted.
+
 ### Configuration
 
 | field | default | what it decides |
