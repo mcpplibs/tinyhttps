@@ -179,11 +179,14 @@ jobs:
   # 5e7d66f reached master.
   #
   # FOUR TARGETS, THE ONES mcpp-index MEASURES tinyhttps ON (its
-  # tests/openkal/pins.toml). x86_64-windows-musl runs under wine and
-  # aarch64-linux-musl under qemu, through the runners examples/openkal names.
-  # The Windows one is where every handshake used to fail for want of entropy
-  # (src/tls.cppm); it has no name resolution, so its network step reports
-  # "no network" and the cancellation check, which needs none, is what runs.
+  # tests/openkal/pins.toml). aarch64-linux-musl runs under qemu, through the
+  # runner examples/openkal names. x86_64-windows-musl is built here and run on
+  # Windows itself by the job after this one: wine took anywhere from four to
+  # more than thirty minutes to install on these runners, and Windows is the
+  # system the program is for. The Windows target is where every handshake used
+  # to fail for want of entropy (src/tls.cppm); it has no name resolution, so its
+  # network step reports "no network" and the cancellation check, which needs
+  # none, is what runs.
   openkal:
     name: build + run (${{ matrix.target }}, above openkal)
     runs-on: ubuntu-24.04
@@ -209,27 +212,15 @@ jobs:
           mcpp --version
           mcpp self config --mirror GLOBAL
 
-      # Only what the target needs, and without recommends: wine64 with them is
-      # a desktop's worth of packages, and one run spent the job's whole budget
-      # in this step. The Windows headers are the ones openkal-windows builds
-      # against; the compilers are mcpp's.
       - name: Install the runner
-        if: matrix.target == 'x86_64-windows-musl' || matrix.target == 'aarch64-linux-musl'
+        if: matrix.target == 'aarch64-linux-musl'
         timeout-minutes: 15
         env:
           DEBIAN_FRONTEND: noninteractive
         run: |
           sudo apt-get update -qq
-          case '${{ matrix.target }}' in
-            x86_64-windows-musl)
-              sudo apt-get install -y -qq --no-install-recommends mingw-w64-x86-64-dev wine64 > /dev/null
-              ls /usr/x86_64-w64-mingw32/include/windows.h
-              command -v wine || sudo ln -s "$(command -v wine64)" /usr/local/bin/wine
-              wine --version ;;
-            aarch64-linux-musl)
-              sudo apt-get install -y -qq --no-install-recommends qemu-user > /dev/null
-              qemu-aarch64 --version | head -1 ;;
-          esac
+          sudo apt-get install -y -qq --no-install-recommends qemu-user > /dev/null
+          qemu-aarch64 --version | head -1
 
       - name: Cache mcpp sandbox
         uses: actions/cache@v4
@@ -248,10 +239,52 @@ jobs:
       # an absence of network. The build, the link, the framing parsers and the
       # cancellation are checked either way.
       - name: Build and run above openkal
+        if: matrix.target != 'x86_64-windows-musl'
         working-directory: examples/openkal
         run: |
           set -o pipefail
           mcpp run --target '${{ matrix.target }}' 2>&1 | tee run.log
+          grep -q '^cancellation: ok' run.log
+
+      # A static PE executable that imports only system DLLs, so it runs on any
+      # Windows as it is.
+      - name: Build for Windows above openkal
+        if: matrix.target == 'x86_64-windows-musl'
+        working-directory: examples/openkal
+        run: |
+          mcpp build --target x86_64-windows-musl
+          mkdir -p "$RUNNER_TEMP/smoke"
+          cp target/x86_64-windows-musl/*/bin/smoke.exe "$RUNNER_TEMP/smoke/"
+
+      - uses: actions/upload-artifact@v4
+        if: matrix.target == 'x86_64-windows-musl'
+        with:
+          name: smoke-x86_64-windows-musl
+          path: ${{ runner.temp }}/smoke/smoke.exe
+          if-no-files-found: error
+
+  openkal-windows:
+    name: run (x86_64-windows-musl, above openkal, on Windows)
+    needs: openkal
+    runs-on: windows-2022
+    timeout-minutes: 15
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: smoke-x86_64-windows-musl
+
+      # Above openkal the Windows certificate store is not read (README,
+      # "Platforms"), so the program is given a bundle: Git for Windows's, copied
+      # beside it, because openkal resolves a relative name against the working
+      # directory and names no absolute path.
+      - name: Run above openkal
+        run: |
+          set -o pipefail
+          cp "/c/Program Files/Git/mingw64/etc/ssl/certs/ca-bundle.crt" ca-bundle.crt
+          SSL_CERT_FILE=ca-bundle.crt ./smoke.exe 2>&1 | tee run.log
           grep -q '^cancellation: ok' run.log
 
   # ── Windows ──────────────────────────────────────────────────────────────────
