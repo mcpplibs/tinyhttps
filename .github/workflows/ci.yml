@@ -232,6 +232,12 @@ jobs:
       # takes the stack beneath it from the index, so what is tested is this
       # commit against the published openkal packages.
       #
+      # The toolchain is named, as mcpp-index's measurement names it. A fresh
+      # runner's default is the gcc mcpp installed first, and with it
+      # x86_64-windows-musl was refused as "cannot be built on this host" even
+      # though the example's own `[toolchain]` names llvm, the one the openkal
+      # runtime supplies that target for.
+      #
       # It cancels a handshake against a local listener, which needs no network,
       # and then makes one HTTPS request; it reports "no network" rather than
       # failing when there is none, so a runner without egress reports "not run"
@@ -243,7 +249,7 @@ jobs:
         working-directory: examples/openkal
         run: |
           set -o pipefail
-          mcpp run --target '${{ matrix.target }}' 2>&1 | tee run.log
+          mcpp run --toolchain llvm@22.1.8 --target '${{ matrix.target }}' 2>&1 | tee run.log
           grep -q '^cancellation: ok' run.log
 
       # A static PE executable that imports only system DLLs, so it runs on any
@@ -252,7 +258,7 @@ jobs:
         if: matrix.target == 'x86_64-windows-musl'
         working-directory: examples/openkal
         run: |
-          mcpp build --target x86_64-windows-musl
+          mcpp build --toolchain llvm@22.1.8 --target x86_64-windows-musl
           mkdir -p "$RUNNER_TEMP/smoke"
           cp target/x86_64-windows-musl/*/bin/smoke.exe "$RUNNER_TEMP/smoke/"
 

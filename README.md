@@ -190,7 +190,8 @@ beneath and not from this library:
 
 CI runs `examples/openkal` for x86_64-linux-gnu, x86_64-linux-musl,
 aarch64-linux-musl (under qemu) and x86_64-windows-musl (built on Linux, run on
-Windows). Locally, `mcpp run --target x86_64-windows-musl` runs it under wine.
+Windows). Locally,
+`mcpp run --toolchain llvm@22.1.8 --target x86_64-windows-musl` runs it under wine.
 
 ## 使用 mcpp 构建
 
