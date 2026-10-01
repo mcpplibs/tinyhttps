@@ -31,7 +31,10 @@ on:
   workflow_dispatch:
 
 env:
-  MCPP_VERSION: 2026.9.28.3
+  # 2026.9.30.2 and not earlier: 2026.9.28.3 refused x86_64-windows-musl
+  # ("cannot be built on this host") before the dependency graph that supplies
+  # its system side, openkal-llvm-runtime, had been resolved.
+  MCPP_VERSION: 2026.9.30.2
   XLINGS_VERSION: v2026.8.17.2
   XLINGS_NON_INTERACTIVE: '1'
 
