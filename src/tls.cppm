@@ -173,6 +173,7 @@ public:
     // inside it, then this session to the target inside the tunnel. Takes
     // ownership of `lower`, which must already be past its CONNECT.
     bool connect_over(std::unique_ptr<TlsSocket> lower, const char* host, bool verifySsl) {
+        error_.clear();
         lower_ = std::move(lower);
         return setup_tls(host, verifySsl);
     }
@@ -277,10 +278,12 @@ private:
     std::unique_ptr<TlsState> state_;
     std::string error_;
 
+    // The session beneath this one, when there is one, is closed as well: a
+    // failed handshake to the target leaves nothing of the tunnel open.
     bool fail(std::string message) {
         error_ = std::move(message);
         state_.reset();
-        socket_.close();
+        drop_transport();
         return false;
     }
 

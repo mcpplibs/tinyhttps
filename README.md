@@ -159,14 +159,14 @@ beneath and not from this library:
 ### 添加依赖
 
 ```bash
-mcpp add tinyhttps@0.3.2
+mcpp add tinyhttps@0.3.3
 ```
 
 或在 `mcpp.toml` 中手动添加：
 
 ```toml
 [dependencies]
-tinyhttps = "0.3.2"
+tinyhttps = "0.3.3"
 ```
 
 ### 构建

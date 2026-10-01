@@ -367,7 +367,10 @@ export ProxyTunnel proxy_tunnel(const ProxyConfig& proxy,
     } else if (proxy.scheme == "https") {
         auto tls = std::make_unique<TlsSocket>();
         if (!tls->connect(proxy.host.c_str(), proxy.port, timeoutMs, verifySsl)) {
+            // The session says why when the TCP connection was up, which is
+            // where a proxy certificate that does not verify is refused.
             tunnel.error = "proxy: could not open a TLS connection to " + where;
+            if (!tls->error().empty()) tunnel.error += ": " + tls->error();
             return tunnel;
         }
         tunnel.error = http_connect(*tls, proxy, targetHost, targetPort, timeoutMs);

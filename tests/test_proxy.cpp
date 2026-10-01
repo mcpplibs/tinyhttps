@@ -9,6 +9,8 @@
 #include "proxy_test_server.hpp"
 #include "tls_test_server.hpp"
 
+#include <cstdlib>
+
 import mcpplibs.tinyhttps;
 import std;
 
@@ -324,6 +326,44 @@ tls_test::Server tls_connect_proxy(Seen& seen, int targetPort, std::string expec
 
 } // namespace
 
+namespace {
+
+// Makes one certificate the only CA bundle the client reads, for the lifetime of
+// the object, and restores what was there before.
+class TrustOnly {
+public:
+    explicit TrustOnly(std::string_view pem)
+        : path_(std::filesystem::temp_directory_path()
+                / ("tinyhttps-proxy-trust-"
+                   + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count())
+                   + ".pem")) {
+        if (const char* old = std::getenv("SSL_CERT_FILE")) { hadOld_ = true; old_ = old; }
+        std::ofstream(path_, std::ios::binary) << pem;
+        set(path_.string().c_str());
+    }
+    ~TrustOnly() {
+        set(hadOld_ ? old_.c_str() : "");
+        std::error_code ec;
+        std::filesystem::remove(path_, ec);
+    }
+    TrustOnly(const TrustOnly&) = delete;
+    TrustOnly& operator=(const TrustOnly&) = delete;
+
+private:
+    static void set(const char* value) {
+#ifdef TINYHTTPS_WINSOCK
+        _putenv_s("SSL_CERT_FILE", value);
+#else
+        ::setenv("SSL_CERT_FILE", value, 1);
+#endif
+    }
+    std::filesystem::path path_;
+    std::string old_;
+    bool hadOld_ { false };
+};
+
+} // namespace
+
 TEST(ProxyUrl, AnHttpsProxyDefaultsToPort443) {
     auto p = https::parse_proxy_url("https://proxy.example");
     EXPECT_EQ(p.scheme, "https");
@@ -345,6 +385,30 @@ TEST_F(ProxyTest, ARequestGoesThroughAnHttpsProxy) {
     auto heads = seen.get();
     ASSERT_EQ(heads.size(), 1u);
     EXPECT_TRUE(heads[0].starts_with("CONNECT 127.0.0.1:" + std::to_string(target.port()) + " HTTP/1.1\r\n"));
+}
+
+// The proxy hop is verified like the target hop, and its refusal names the hop
+// and the reason. Only the wrong-name certificate is trusted, so the proxy's own
+// certificate has no issuer the client knows; nothing, the CONNECT included,
+// reaches a peer that did not verify.
+TEST_F(ProxyTest, AnHttpsProxyWhoseCertificateDoesNotVerifyIsRefusedWithTheReason) {
+    auto target = hello_server();
+    Seen seen;
+    auto proxy = tls_connect_proxy(seen, target.port());
+    ASSERT_FALSE(proxy.failed());
+    TrustOnly bundle(tls_test::kWrongNameCertPem);
+
+    auto cfg = proxied("https://127.0.0.1:" + std::to_string(proxy.port()));
+    cfg.verifySsl = true;
+    https::HttpClient client(cfg);
+    auto resp = client.send(get(target.url("/")));
+
+    EXPECT_EQ(resp.statusCode, 0);
+    EXPECT_TRUE(resp.statusText.starts_with("proxy: could not open a TLS connection to 127.0.0.1:"))
+        << resp.statusText;
+    EXPECT_NE(resp.statusText.find("certificate verification failed"), std::string::npos)
+        << resp.statusText;
+    EXPECT_TRUE(seen.get().empty());
 }
 
 TEST_F(ProxyTest, CredentialsGoToAnHttpsProxyInsideItsTlsSession) {

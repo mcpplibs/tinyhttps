@@ -1,6 +1,14 @@
 # Changelog
 
-## Unreleased
+## 0.3.3
+
+**Behaviour change, and the reason for this release:** `verifySsl = true` (the
+default) now verifies the server certificate, and with no CA bundle to verify
+against a connection fails instead of going ahead unverified
+([#20](https://github.com/mcpplibs/tinyhttps/issues/20)). It is a patch release
+so that every dependency written `tinyhttps = "0.3.x"` receives it.
+
+### Certificate verification
 
 `verifySsl = true` now verifies the server certificate. The handshake used to
 complete with any certificate (a self-signed one, one for another host, an
@@ -20,6 +28,13 @@ result afterwards.
   certificate store that are usable for TLS servers are read. That code is built
   only for Windows Sockets targets, not for the musl one. MinGW builds need
   `-lcrypt32`, as they already need `-lws2_32`.
+* `examples/openkal` exits 1 when the certificate is refused; it used to read
+  every failure as an absence of network. CI builds and runs the Windows store
+  reader on windows-2022 under msvc and llvm (`tests/test_ca_store.cpp`).
+* MSVC builds link `bcrypt`, from which mbedTLS draws entropy; its package asks
+  for it as `-lbcrypt`, which link.exe does not read.
+
+### Proxies
 
 Proxy URLs carry credentials, and a proxy that refuses the tunnel says why.
 
@@ -58,6 +73,12 @@ HTTP. And every refusal, whatever the proxy said, reached the caller as
   in `statusText` the same way as for an HTTP proxy. The default port is 1080.
   SOCKS4 is not supported and, like any unknown scheme, is an error.
 * `Socket::resolve_address` returns the address a name resolves to as raw bytes.
+* The connection to an `https://` proxy is verified like the connection to the
+  target, and a refusal names both the hop and the reason, for example
+  `proxy: could not open a TLS connection to proxy:443: certificate
+  verification failed: ...`. The CONNECT, and any credentials, are sent only
+  after the proxy's certificate has verified.
+* A failed handshake inside a tunnel closes the tunnel's session as well.
 
 ## 0.3.2
 
