@@ -7,16 +7,20 @@ can abandon a request that is in flight.
 
 * When the token is stopped the call returns within about 50 ms with
   `HttpResponse::cancelled` set, and the connection is closed instead of being
-  returned to the pool. It covers connect, the proxy CONNECT exchange, the TLS
-  handshake, waiting for the response head, reading the body and the gaps
-  between streaming callbacks.
+  returned to the pool. It covers connect, the exchange with an HTTP, https or
+  SOCKS5 proxy, the TLS handshake, waiting for the response head, reading the
+  body and the gaps between streaming callbacks.
 * Before the status line arrives the response is `statusCode` 0 with
   `statusText` and `bodyError` `Cancelled`. After it, `statusCode` is the
   server's and `bodyError` is `cancelled`. A cancelled request is not retried on
-  a new connection and its redirect is not followed.
-* Not covered: name resolution, and a write that is blocked because the server
-  is not reading. Without a token nothing changes.
-* `proxy_connect` takes the token as a trailing default argument.
+  a new connection and its redirect is not followed. `ok()` does not look at
+  `cancelled`, as it does not look at `bodyComplete`.
+* Not covered: name resolution (`getaddrinfo`, and the lookup `socks5://` does
+  for the target), and a write that is blocked because the server is not
+  reading. Without a token nothing changes.
+* `proxy_connect` and `proxy_tunnel` take the token as a trailing default
+  argument. `Socket` and `TlsSocket` gain `set_stop`, and `Socket` gains
+  `stop_possible`.
 
 ## 0.3.3
 

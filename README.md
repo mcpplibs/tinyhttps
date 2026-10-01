@@ -53,16 +53,16 @@ another thread. The call returns within about 50 ms with `cancelled` set, and
 the connection is closed rather than pooled.
 
 ```cpp
-std::stop_source source;
-auto worker = std::jthread([&] { response = client.send(request, source.get_token()); });
+HttpResponse response;
+std::jthread worker([&](std::stop_token stop) { response = client.send(request, stop); });
 // elsewhere:
-source.request_stop();
+worker.request_stop();
 ```
 
 If the status line had not arrived, `statusCode` is 0 and `statusText` is
 `Cancelled`; otherwise they are the server's and `bodyError` is `cancelled`.
-Name resolution and a write blocked on a server that is not reading cannot be
-interrupted.
+As with `bodyComplete`, `ok()` does not look at `cancelled`. Name resolution
+and a write blocked on a server that is not reading cannot be interrupted.
 
 ### Configuration
 
