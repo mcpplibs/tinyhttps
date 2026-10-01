@@ -89,6 +89,7 @@ public:
         // musl-static build can't — its nameservers live in $PREFIX/etc/resolv.conf
         // which libc never reads — so fall back to a manual DNS query there.
         auto try_resolved = [&](const char* node, bool numeric) -> bool {
+            if (stop_.stop_requested()) return false;
             struct addrinfo hints{};
             hints.ai_family = AF_UNSPEC;
             hints.ai_socktype = SOCK_STREAM;
@@ -110,6 +111,7 @@ public:
             // Fall back to a manual DNS query when libc can't resolve (Termux:
             // nameservers live in $PREFIX/etc/resolv.conf, which libc ignores).
             auto try_manual = [&]() -> bool {
+                if (stop_.stop_requested()) return false;
                 // DNS must be snappy: a UDP query to a working resolver answers
                 // in well under a second. Cap it hard (independent of the much
                 // larger connect timeout) so an intermittently-dropped packet to
@@ -180,6 +182,7 @@ public:
     // Connect to the first reachable address in a resolved list.
     bool connect_addrinfo(struct addrinfo* result, int timeoutMs) {
         for (auto* rp = result; rp != nullptr; rp = rp->ai_next) {
+            if (stop_.stop_requested()) return false;
             SocketHandle fd = ::socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
             if (fd == INVALID_SOCKET_FD) {
                 continue;
