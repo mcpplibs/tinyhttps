@@ -52,7 +52,7 @@ means exactly what it did before.
 | --- | --- | --- |
 | `connectTimeoutMs` | 10000 | TCP connect |
 | `readTimeoutMs` | 60000 | any single read, and the total wait on a blocked write |
-| `verifySsl` | true | verify the server certificate |
+| `verifySsl` | true | verify the server certificate against the CA bundle (`SSL_CERT_FILE`, else the Windows `ROOT` certificate store in Windows Sockets builds, else a system location); the connection fails if the certificate is not trusted, has expired or is for another host, or if no bundle is found |
 | `keepAlive` | true | reuse connections between requests |
 | `maxRedirects` | 10 | 0 disables redirect following |
 | `maxResponseBodyBytes` | 64 MiB | the most `send()` will hold in memory; does not bound `download_to_file` or `send_stream` |

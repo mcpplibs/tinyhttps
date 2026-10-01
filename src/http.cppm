@@ -1034,8 +1034,10 @@ private:
                 auto [inserted, ok] = pool_.emplace(poolKey, TlsSocket{});
                 sock = &inserted->second;
                 if (!open_connection(*sock, parsed)) {
+                    std::string why = sock->error().empty() ? "Connection failed"
+                                                             : sock->error();
                     guard.drop();
-                    return { nullptr, {}, "Connection failed" };
+                    return { nullptr, {}, std::move(why) };
                 }
             }
 
