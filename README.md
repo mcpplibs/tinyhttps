@@ -109,6 +109,17 @@ differs between them.
 cd examples/openkal && mcpp run
 ```
 
+Above openkal two things differ from a host build. Both follow from the layer
+beneath and not from this library:
+
+- On Windows the socket interface is the POSIX one, because the C library is
+  musl, so the Windows `ROOT` certificate store is not read. Set `SSL_CERT_FILE`
+  to a PEM bundle of trusted roots; without one every HTTPS connection is
+  refused, and `statusText` says so.
+- `connectTimeoutMs` does not bound the TCP connect. `kal_net_connect` has no
+  form that begins a connection and reports its outcome later, so the connect
+  completes or fails before it returns.
+
 ## 使用 mcpp 构建
 
 ### 添加依赖
