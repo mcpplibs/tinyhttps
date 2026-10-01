@@ -85,7 +85,13 @@ T0 计划（本文）+ 设计文档纳入 PR
 
 某个平台上测试编不过时，**修测试，不删平台**。确实做不到的，单独开 issue 记下原因，并在 job 里写清楚。
 
-## 5. 验收
+## 5. 过程中发现并修复
+
+- **x86_64-windows-musl 上 TLS 从来没通过。** mbedTLS 只有识别到 glibc 才用 `getrandom`，否则读 `/dev/urandom`，而 openkal-windows 没有这个文件。在 musl 平台上改用 musl 的 `getentropy`（`cfg(c-abi = "musl")` → `TINYHTTPS_GETENTROPY`）🔁。
+- **Windows 目标没有名字解析**（openkal 没有解析器接口），已登记 [openkal-musl#46](https://github.com/mcpplibs/openkal-musl/issues/46)，README 已注明。
+- **`test_pool` 在 Windows 上编不过**（`<windows.h>` 的 `max` 宏），因为以前从没在 Windows 上编译过；已修复。
+
+## 6. 验收
 
 - [ ] PR #23 的 CI 全绿（上表全部 job）
 - [ ] 自审：H1、M1、M2、D1、D2 全部落地；PR 描述更新

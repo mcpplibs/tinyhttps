@@ -184,8 +184,9 @@ beneath and not from this library:
   completes or fails before it returns. A stop token is checked before the
   connect, not during it.
 - On Windows there is no name resolution: openkal has no resolver interface,
-  and musl's reads `/etc/resolv.conf`, which Windows does not have. A URL with
-  an address in it connects.
+  and musl's reads `/etc/resolv.conf`, which Windows does not have
+  ([openkal-musl#46](https://github.com/mcpplibs/openkal-musl/issues/46)). A URL
+  with an address in it connects.
 
 CI runs `examples/openkal` for x86_64-linux-gnu, x86_64-linux-musl,
 aarch64-linux-musl (under qemu) and x86_64-windows-musl (under wine).
