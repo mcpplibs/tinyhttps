@@ -7,7 +7,7 @@ Minimal C++23 HTTP/HTTPS client library with SSE (Server-Sent Events) streaming 
 - HTTP/HTTPS client with connection pooling (keep-alive)
 - SSE (Server-Sent Events) streaming
 - Streaming downloads to a file, with progress and cancellation
-- Proxy support (HTTP CONNECT, with Basic authentication)
+- Proxy support (HTTP CONNECT, over plain HTTP or TLS, with Basic authentication)
 - C++23 modules
 
 ## Usage
@@ -67,10 +67,12 @@ Set `proxy` to a URL and every request is tunnelled through it with `CONNECT`:
 cfg.proxy = "http://user:pass@proxy.example:3128";
 ```
 
-The scheme is `http`, and a bare `host:port` means the same. Credentials are
-read from the URL and sent as Basic `Proxy-Authorization`; percent-escape any
-character that is special in a URL (`p%40ss` for `p@ss`). The port defaults to
-8080.
+The scheme is `http` (a bare `host:port` means the same) or `https`. An
+`https://` proxy is reached over TLS first, the `CONNECT` is sent inside that
+session, and the connection to the target is a second TLS session inside the
+tunnel; the two connections are set up alike, `verifySsl` included. Credentials
+are read from the URL and sent as Basic `Proxy-Authorization`; percent-escape any character that is special in
+a URL (`p%40ss` for `p@ss`). The port defaults to 8080, or 443 for `https`.
 
 When the proxy refuses the tunnel, `statusCode` is 0 and `statusText` carries
 its answer: `proxy rejected the credentials: 407 Proxy Authentication Required`,

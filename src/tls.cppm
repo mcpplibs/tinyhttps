@@ -108,11 +108,10 @@ public:
     // Move constructor
     TlsSocket(TlsSocket&& other) noexcept
         : socket_(std::move(other.socket_))
+        , lower_(std::move(other.lower_))
         , state_(std::move(other.state_)) {
         // Re-bind BIO to point to our socket_ (not the moved-from one)
-        if (state_) {
-            mbedtls_ssl_set_bio(&state_->ssl, &socket_, bio_send, bio_recv, nullptr);
-        }
+        bind_bio();
     }
 
     // Move assignment
@@ -120,23 +119,31 @@ public:
         if (this != &other) {
             close();
             socket_ = std::move(other.socket_);
+            lower_ = std::move(other.lower_);
             state_ = std::move(other.state_);
             // Re-bind BIO to point to our socket_
-            if (state_) {
-                mbedtls_ssl_set_bio(&state_->ssl, &socket_, bio_send, bio_recv, nullptr);
-            }
+            bind_bio();
         }
         return *this;
     }
 
     [[nodiscard]] bool is_valid() const {
-        return state_ != nullptr && socket_.is_valid();
+        return state_ != nullptr && (lower_ ? lower_->is_valid() : socket_.is_valid());
     }
 
     // Connect over an already-established Socket (e.g. a proxy tunnel).
     // Takes ownership of the socket and performs TLS handshake on top of it.
     bool connect_over(Socket&& socket, const char* host, bool verifySsl) {
         socket_ = std::move(socket);
+        return setup_tls(host, verifySsl);
+    }
+
+    // Run the handshake inside another TLS session, which is how a client
+    // reaches a target through an https:// proxy: TLS to the proxy, CONNECT
+    // inside it, then this session to the target inside the tunnel. Takes
+    // ownership of `lower`, which must already be past its CONNECT.
+    bool connect_over(std::unique_ptr<TlsSocket> lower, const char* host, bool verifySsl) {
+        lower_ = std::move(lower);
         return setup_tls(host, verifySsl);
     }
 
@@ -207,6 +214,8 @@ public:
             mbedtls_ssl_close_notify(&state_->ssl);
             state_.reset();
         }
+        // Only after the close_notify above, which travels through it.
+        lower_.reset();
         socket_.close();
     }
 
@@ -215,7 +224,9 @@ public:
         if (state_ && mbedtls_ssl_get_bytes_avail(&state_->ssl) > 0) {
             return true;
         }
-        return socket_.wait_readable(timeoutMs);
+        // Under another session the bytes may be decrypted and waiting there
+        // while the descriptor has nothing, so ask that session, not the fd.
+        return lower_ ? lower_->wait_readable(timeoutMs) : socket_.wait_readable(timeoutMs);
     }
 
     // TLS back-pressure is a wait, not a failure. `mbedtls_ssl_write` reports
@@ -223,12 +234,54 @@ public:
     // that into 0; without something to wait on, `write_all` could only retry
     // at once and then give up, which reached the caller as "Write failed".
     bool wait_writable(int timeoutMs) {
-        return socket_.wait_writable(timeoutMs);
+        return lower_ ? lower_->wait_writable(timeoutMs) : socket_.wait_writable(timeoutMs);
     }
 
 private:
     Socket socket_;
+    // The session this one runs inside, when there is one; `socket_` is unused
+    // then. Declared before `state_` so it is destroyed after it: the BIO of
+    // `state_` points at it.
+    std::unique_ptr<TlsSocket> lower_;
     std::unique_ptr<TlsState> state_;
+
+    // The BIO of a session that runs inside another is that session, which stays
+    // put when this object moves; the BIO of one on a socket is `socket_`, which
+    // moves with it.
+    void bind_bio() {
+        if (!state_) return;
+        if (lower_) {
+            mbedtls_ssl_set_bio(&state_->ssl, lower_.get(), send_over_tls, recv_over_tls, nullptr);
+        } else {
+            mbedtls_ssl_set_bio(&state_->ssl, &socket_, bio_send, bio_recv, nullptr);
+        }
+    }
+
+    static int send_over_tls(void* ctx, const unsigned char* buf, size_t len) {
+        int ret = static_cast<TlsSocket*>(ctx)->write(reinterpret_cast<const char*>(buf),
+                                                      static_cast<int>(len));
+        if (ret < 0) return MBEDTLS_ERR_NET_SEND_FAILED;
+        if (ret == 0) return MBEDTLS_ERR_SSL_WANT_WRITE;
+        return ret;
+    }
+
+    // As `bio_recv`: an end of stream is passed on as a zero.
+    static int recv_over_tls(void* ctx, unsigned char* buf, size_t len) {
+        auto r = static_cast<TlsSocket*>(ctx)->read_some(reinterpret_cast<char*>(buf),
+                                                         static_cast<int>(len));
+        switch (r.status) {
+            case ReadStatus::Data:       return r.bytes;
+            case ReadStatus::Eof:        return 0;
+            case ReadStatus::WouldBlock: return MBEDTLS_ERR_SSL_WANT_READ;
+            case ReadStatus::Error:      break;
+        }
+        return MBEDTLS_ERR_NET_RECV_FAILED;
+    }
+
+    void drop_transport() {
+        lower_.reset();
+        socket_.close();
+    }
 
     bool setup_tls(const char* host, bool verifySsl) {
         state_ = std::make_unique<TlsState>();
@@ -238,7 +291,7 @@ private:
             nullptr, 0);
         if (ret != 0) {
             state_.reset();
-            socket_.close();
+            drop_transport();
             return false;
         }
 
@@ -249,7 +302,7 @@ private:
             MBEDTLS_SSL_PRESET_DEFAULT);
         if (ret != 0) {
             state_.reset();
-            socket_.close();
+            drop_transport();
             return false;
         }
 
@@ -269,7 +322,7 @@ private:
             // ret > 0 means some certs failed to parse but others succeeded — acceptable
             if (ret < 0) {
                 state_.reset();
-                socket_.close();
+                drop_transport();
                 return false;
             }
             mbedtls_ssl_conf_ca_chain(&state_->conf, &state_->ca_cert, nullptr);
@@ -288,7 +341,7 @@ private:
         ret = mbedtls_ssl_setup(&state_->ssl, &state_->conf);
         if (ret != 0) {
             state_.reset();
-            socket_.close();
+            drop_transport();
             return false;
         }
 
@@ -296,18 +349,18 @@ private:
         ret = mbedtls_ssl_set_hostname(&state_->ssl, host);
         if (ret != 0) {
             state_.reset();
-            socket_.close();
+            drop_transport();
             return false;
         }
 
-        // Set BIO callbacks using our Socket
-        mbedtls_ssl_set_bio(&state_->ssl, &socket_, bio_send, bio_recv, nullptr);
+        // Set BIO callbacks using our Socket, or the session beneath this one
+        bind_bio();
 
         // Perform TLS handshake
         while ((ret = mbedtls_ssl_handshake(&state_->ssl)) != 0) {
             if (ret != MBEDTLS_ERR_SSL_WANT_READ && ret != MBEDTLS_ERR_SSL_WANT_WRITE) {
                 state_.reset();
-                socket_.close();
+                drop_transport();
                 return false;
             }
         }

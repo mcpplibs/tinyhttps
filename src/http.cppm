@@ -1003,10 +1003,14 @@ private:
         if (config_.proxy.has_value()) {
             auto tunnel = proxy_tunnel(parse_proxy_url(config_.proxy.value()),
                                        parsed.host, parsed.port,
-                                       config_.connectTimeoutMs);
+                                       config_.connectTimeoutMs, config_.verifySsl);
             if (!tunnel.ok()) {
                 error = std::move(tunnel.error);
                 return false;
+            }
+            if (tunnel.proxyTls) {
+                return sock.connect_over(std::move(tunnel.proxyTls), parsed.host.c_str(),
+                                         config_.verifySsl);
             }
             return sock.connect_over(std::move(tunnel.socket), parsed.host.c_str(),
                                      config_.verifySsl);

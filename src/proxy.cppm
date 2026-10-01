@@ -1,6 +1,7 @@
 export module mcpplibs.tinyhttps:proxy;
 
 import :socket;
+import :tls;
 import std;
 
 namespace mcpplibs::tinyhttps {
@@ -12,8 +13,9 @@ export struct ProxyConfig {
     std::string host;
     int port { 8080 };
 
-    // Lower case. "http" when the URL has no scheme, which is how a bare
-    // `host:port` has always been read.
+    // Lower case: "http", or "https" for a proxy that is itself reached over
+    // TLS. "http" when the URL has no scheme, which is how a bare `host:port`
+    // has always been read.
     std::string scheme { "http" };
 
     // From `user:password@` in the URL, percent-decoded. A URL with `@` and no
@@ -48,7 +50,8 @@ static std::string percent_decode(std::string_view in) {
 }
 
 // Parse "[scheme://][user[:password]@]host[:port]". A path, query or fragment
-// after the authority is ignored. IPv6 literals are written in brackets.
+// after the authority is ignored. IPv6 literals are written in brackets. The
+// port defaults to 443 for https and to 8080 otherwise.
 export ProxyConfig parse_proxy_url(std::string_view url) {
     ProxyConfig config;
 
@@ -93,6 +96,8 @@ export ProxyConfig parse_proxy_url(std::string_view url) {
     } else {
         config.host = std::string(url);
     }
+
+    if (config.scheme == "https") config.port = 443;
 
     if (hasPort && !portStr.empty()) {
         // Anything but 1..65535 becomes 0, which no connect will accept.
@@ -207,33 +212,48 @@ static std::string http_connect(Stream& sock, const ProxyConfig& proxy,
     return "proxy: response to CONNECT has too many headers";
 }
 
-// A connection to the target through a proxy. `error` is empty exactly when
-// `socket` is the tunnel; otherwise it says what the proxy did, in words fit
-// for a caller to log.
+// A connection to the target through a proxy. `error` is empty exactly when the
+// tunnel is open; otherwise it says what the proxy did, in words fit for a
+// caller to log.
+//
+// The tunnel is `socket`, except for an https:// proxy, where it is the TLS
+// session to the proxy, `proxyTls`, and `socket` is unused.
 export struct ProxyTunnel {
     Socket socket;
+    std::unique_ptr<TlsSocket> proxyTls;
     std::string error;
 
-    [[nodiscard]] bool ok() const { return error.empty() && socket.is_valid(); }
+    [[nodiscard]] bool ok() const {
+        return error.empty() && (proxyTls ? proxyTls->is_valid() : socket.is_valid());
+    }
 };
 
+// `verifySsl` is for the connection to an https:// proxy, and is the same
+// setting that governs the connection to the target.
 export ProxyTunnel proxy_tunnel(const ProxyConfig& proxy,
                                 std::string_view targetHost, int targetPort,
-                                int timeoutMs) {
+                                int timeoutMs, bool verifySsl = true) {
     ProxyTunnel tunnel;
+    const std::string where = proxy.host + ":" + std::to_string(proxy.port);
 
-    if (proxy.scheme != "http") {
+    if (proxy.scheme == "http") {
+        if (!tunnel.socket.connect(proxy.host.c_str(), proxy.port, timeoutMs)) {
+            tunnel.error = "proxy: could not connect to " + where;
+            return tunnel;
+        }
+        tunnel.error = http_connect(tunnel.socket, proxy, targetHost, targetPort, timeoutMs);
+        if (!tunnel.error.empty()) tunnel.socket.close();
+    } else if (proxy.scheme == "https") {
+        auto tls = std::make_unique<TlsSocket>();
+        if (!tls->connect(proxy.host.c_str(), proxy.port, timeoutMs, verifySsl)) {
+            tunnel.error = "proxy: could not open a TLS connection to " + where;
+            return tunnel;
+        }
+        tunnel.error = http_connect(*tls, proxy, targetHost, targetPort, timeoutMs);
+        if (tunnel.error.empty()) tunnel.proxyTls = std::move(tls);
+    } else {
         tunnel.error = "proxy: unsupported scheme '" + proxy.scheme + "'";
-        return tunnel;
     }
-
-    if (!tunnel.socket.connect(proxy.host.c_str(), proxy.port, timeoutMs)) {
-        tunnel.error = "proxy: could not connect to " + proxy.host + ":" + std::to_string(proxy.port);
-        return tunnel;
-    }
-
-    tunnel.error = http_connect(tunnel.socket, proxy, targetHost, targetPort, timeoutMs);
-    if (!tunnel.error.empty()) tunnel.socket.close();
     return tunnel;
 }
 

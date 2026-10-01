@@ -278,3 +278,186 @@ TEST_F(ProxyTest, TheOriginalProxyConnectStillReturnsATunnel) {
                                        target.port(), 4000);
     EXPECT_TRUE(tunnel.is_valid());
 }
+
+// ── an https:// proxy ────────────────────────────────────────────────────────
+//
+// The proxy here is the TLS test server: the client opens TLS to it, sends
+// CONNECT inside that, and then opens a second TLS session to the target inside
+// the tunnel. Two sessions on one descriptor is what these tests exist to
+// exercise, and the cases that matter are the ones where the two disagree about
+// what is readable: a body larger than a record, and a second request that has
+// to find the tunnel already open.
+
+namespace {
+
+// A recorder for what the TLS proxy saw. The handler runs on the server's
+// threads; the test reads it after the response is in.
+struct Seen {
+    std::mutex mutex;
+    std::vector<std::string> heads;
+    void add(std::string head) {
+        std::lock_guard<std::mutex> lock(mutex);
+        heads.push_back(std::move(head));
+    }
+    std::vector<std::string> get() {
+        std::lock_guard<std::mutex> lock(mutex);
+        return heads;
+    }
+};
+
+tls_test::Server tls_connect_proxy(Seen& seen, int targetPort, std::string expectAuth = {},
+                                   std::chrono::milliseconds gather = std::chrono::milliseconds::zero()) {
+    return tls_test::Server([&seen, targetPort, expectAuth, gather](tls_test::Conn& conn, int) {
+        seen.add(conn.request());
+        if (!expectAuth.empty()
+            && header_of(conn.request(), "Proxy-Authorization") != expectAuth) {
+            conn.write("HTTP/1.1 407 Proxy Authentication Required\r\n"
+                       "Proxy-Authenticate: Basic realm=\"test\"\r\n"
+                       "Content-Length: 0\r\n\r\n");
+            return false;
+        }
+        conn.write(kEstablished);
+        conn.relay_to(targetPort, gather);
+        return false;
+    });
+}
+
+} // namespace
+
+TEST(ProxyUrl, AnHttpsProxyDefaultsToPort443) {
+    auto p = https::parse_proxy_url("https://proxy.example");
+    EXPECT_EQ(p.scheme, "https");
+    EXPECT_EQ(p.port, 443);
+    EXPECT_EQ(https::parse_proxy_url("https://proxy.example:8443").port, 8443);
+}
+
+TEST_F(ProxyTest, ARequestGoesThroughAnHttpsProxy) {
+    auto target = hello_server();
+    Seen seen;
+    auto proxy = tls_connect_proxy(seen, target.port());
+    ASSERT_FALSE(proxy.failed());
+
+    https::HttpClient client(proxied("https://127.0.0.1:" + std::to_string(proxy.port())));
+    auto resp = client.send(get(target.url("/")));
+
+    EXPECT_EQ(resp.statusCode, 200);
+    EXPECT_EQ(resp.body, "hello");
+    auto heads = seen.get();
+    ASSERT_EQ(heads.size(), 1u);
+    EXPECT_TRUE(heads[0].starts_with("CONNECT 127.0.0.1:" + std::to_string(target.port()) + " HTTP/1.1\r\n"));
+}
+
+TEST_F(ProxyTest, CredentialsGoToAnHttpsProxyInsideItsTlsSession) {
+    auto target = hello_server();
+    Seen seen;
+    auto proxy = tls_connect_proxy(seen, target.port(), "Basic YWxpY2U6czNjcmV0");
+
+    https::HttpClient ok(proxied("https://alice:s3cret@127.0.0.1:" + std::to_string(proxy.port())));
+    EXPECT_EQ(ok.send(get(target.url("/"))).statusCode, 200);
+
+    https::HttpClient bad(proxied("https://alice:nope@127.0.0.1:" + std::to_string(proxy.port())));
+    auto resp = bad.send(get(target.url("/")));
+    EXPECT_EQ(resp.statusCode, 0);
+    EXPECT_NE(resp.statusText.find("rejected the credentials"), std::string::npos);
+}
+
+TEST_F(ProxyTest, ABodyLargerThanARecordCrossesBothSessions) {
+    std::string big(300 * 1024, 'x');
+    for (std::size_t i = 0; i < big.size(); i += 97) big[i] = static_cast<char>('a' + i % 26);
+    tls_test::Server target([&](tls_test::Conn& conn, int) {
+        conn.write(tls_test::ok_response(big));
+        return true;
+    });
+    Seen seen;
+    auto proxy = tls_connect_proxy(seen, target.port());
+
+    https::HttpClient client(proxied("https://127.0.0.1:" + std::to_string(proxy.port())));
+    auto resp = client.send(get(target.url("/")));
+
+    EXPECT_EQ(resp.statusCode, 200);
+    EXPECT_TRUE(resp.bodyComplete);
+    EXPECT_TRUE(resp.body == big);
+}
+
+TEST_F(ProxyTest, TwoRequestsShareOneTunnelThroughAnHttpsProxy) {
+    auto target = hello_server();
+    Seen seen;
+    auto proxy = tls_connect_proxy(seen, target.port());
+
+    https::HttpClient client(proxied("https://127.0.0.1:" + std::to_string(proxy.port())));
+    EXPECT_EQ(client.send(get(target.url("/a"))).statusCode, 200);
+    EXPECT_EQ(client.send(get(target.url("/b"))).statusCode, 200);
+
+    EXPECT_EQ(proxy.accepts(), 1);
+    EXPECT_EQ(target.accepts(), 1);
+}
+
+// The target writes the head and the body as two records and the proxy hands
+// them on as one, so both arrive in a single record of the proxy session. The
+// client reads the first through the proxy session and the descriptor is then
+// empty while the second sits decrypted in that session: waiting on the
+// descriptor, rather than on the session, would time out on a response that has
+// already arrived.
+TEST_F(ProxyTest, ABodyAlreadyDecryptedInTheProxySessionIsNotWaitedFor) {
+    tls_test::Server target([](tls_test::Conn& conn, int) {
+        conn.write("HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n");
+        conn.write("hello");
+        return true;
+    });
+    Seen seen;
+    auto proxy = tls_connect_proxy(seen, target.port(), {}, std::chrono::milliseconds(150));
+
+    https::HttpClient client(proxied("https://127.0.0.1:" + std::to_string(proxy.port())));
+    auto resp = client.send(get(target.url("/")));
+
+    EXPECT_EQ(resp.statusCode, 200);
+    EXPECT_EQ(resp.body, "hello");
+}
+
+TEST_F(ProxyTest, AStreamingRequestWorksThroughAnHttpsProxy) {
+    tls_test::Server target([](tls_test::Conn& conn, int) {
+        conn.write("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n"
+                   "Connection: close\r\n\r\ndata: one\n\ndata: two\n\n");
+        return false;
+    });
+    Seen seen;
+    auto proxy = tls_connect_proxy(seen, target.port());
+
+    https::HttpClient client(proxied("https://127.0.0.1:" + std::to_string(proxy.port())));
+    std::vector<std::string> events;
+    auto resp = client.send_stream(get(target.url("/")), [&](const https::SseEvent& ev) {
+        events.push_back(ev.data);
+        return true;
+    });
+
+    EXPECT_EQ(resp.statusCode, 200);
+    ASSERT_EQ(events.size(), 2u);
+    EXPECT_EQ(events[0], "one");
+    EXPECT_EQ(events[1], "two");
+}
+
+// The handshake has no timeout of its own, so the proxy ends it the way a real
+// HTTP proxy does when it is sent something that is not HTTP: it reads the first
+// bytes and hangs up.
+TEST_F(ProxyTest, AnHttpsUrlToAPlainProxyFailsAtTheHandshake) {
+    auto target = hello_server();
+    proxy_test::Server proxy([](proxy_test::Peer& peer) { peer.read_some(); });
+
+    https::HttpClient client(proxied("https://127.0.0.1:" + std::to_string(proxy.port())));
+    auto resp = client.send(get(target.url("/")));
+
+    EXPECT_EQ(resp.statusCode, 0);
+    EXPECT_NE(resp.statusText.find("TLS connection"), std::string::npos);
+}
+
+TEST_F(ProxyTest, AnHttpUrlToATlsProxyIsAnErrorAndNotAHang) {
+    auto target = hello_server();
+    Seen seen;
+    auto proxy = tls_connect_proxy(seen, target.port());
+
+    https::HttpClient client(proxied("http://127.0.0.1:" + std::to_string(proxy.port())));
+    auto resp = client.send(get(target.url("/")));
+
+    EXPECT_EQ(resp.statusCode, 0);
+    EXPECT_FALSE(resp.statusText.empty());
+}

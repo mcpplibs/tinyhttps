@@ -28,6 +28,13 @@ HTTP. And every refusal, whatever the proxy said, reached the caller as
 * New `proxy_tunnel` returns the tunnel together with the reason it could not
   be made. `proxy_connect` keeps its signature and calls it, so it also accepts
   any 2xx answer now.
+* An `https://` proxy URL is spoken to over TLS: the session to the proxy
+  carries the `CONNECT`, and the session to the target runs inside the tunnel.
+  `TlsSocket` can now run over another `TlsSocket` (`connect_over` takes the
+  lower session), and its `wait_readable` asks that session rather than the
+  descriptor, because the bytes may already be decrypted there. The proxy
+  connection is set up like the one to the target, `verifySsl` included. The
+  default port for `https` is 443.
 
 ## 0.3.2
 

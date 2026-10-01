@@ -53,6 +53,9 @@ public:
     // read a byte at a time so nothing past it is taken. Empty on a hang-up.
     std::string read_head();
 
+    // Whatever arrives first, up to 4 KiB. Empty on a hang-up.
+    std::string read_some();
+
     bool write(std::string_view data) {
         std::size_t sent = 0;
         while (sent < data.size()) {
@@ -178,6 +181,18 @@ inline std::string Peer::read_head() {
         head.push_back(static_cast<char>(c));
     }
     return head;
+}
+
+inline std::string Peer::read_some() {
+    unsigned char buf[4096];
+    for (int waited = 0; waited < 20000; waited += 50) {
+        if (server_.stopping()) return {};
+        if (!wait_readable(50)) continue;
+        int n = mbedtls_net_recv(&net_, buf, sizeof buf);
+        return n > 0 ? std::string(reinterpret_cast<char*>(buf), static_cast<std::size_t>(n))
+                     : std::string();
+    }
+    return {};
 }
 
 inline void Peer::relay_to(int port) {
