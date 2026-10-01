@@ -58,6 +58,11 @@ export struct HttpResponse {
     // "Invalid chunk size: zz" where the server had said "OK".
     std::string bodyError;
 
+    // True when the caller's stop token ended the request. Then `bodyComplete`
+    // is false, and the status line is the server's if it had arrived and
+    // 0 / "Cancelled" if not.
+    bool cancelled { false };
+
     bool ok() const { return statusCode >= 200 && statusCode < 300; }
 };
 
@@ -143,6 +148,12 @@ export struct DownloadToFileResult {
     // machine could not keep it" without matching text in `error`; a checksum
     // failure downstream of a truncated file otherwise blames the wrong party.
     bool writeFailed { false };
+
+    // True when the caller abandoned the transfer: `isCancelled` returned true
+    // or the stop token was stopped. `error` is then "Cancelled" if no status
+    // line had arrived and "cancelled" if one had, as for `HttpResponse`. A
+    // destination that failed first is reported as that instead.
+    bool cancelled { false };
 
     bool ok() const { return statusCode >= 200 && statusCode < 300 && error.empty(); }
 };
@@ -837,7 +848,16 @@ public:
 
     // Call only where the body was read to the end its framing declared and the
     // response did not ask for the connection to close.
-    void keep() noexcept { armed_ = false; }
+    //
+    // A connection in the pool carries no stop token. The call that used it
+    // set its own (`perform_exchange`), and the caller may stop that token
+    // after this call has returned — a `std::jthread` does so in its
+    // destructor — which must not reach whatever takes the connection next.
+    void keep() noexcept {
+        if (!armed_) return;
+        armed_ = false;
+        if (auto it = pool_.find(key_); it != pool_.end()) it->second.set_stop({});
+    }
 
     // Drop now rather than at the end of the scope. Idempotent, and a no-op
     // after `keep()`.
@@ -880,14 +900,21 @@ public:
     HttpClient(HttpClient&&) = default;
     HttpClient& operator=(HttpClient&&) = default;
 
-    HttpResponse send(const HttpRequest& request) {
-        return send_impl(request, 0);
+    // `stop` can be stopped from another thread to abandon the request: the
+    // call returns within about 50 ms with `cancelled` set, and the connection
+    // is closed rather than pooled. It cannot interrupt name resolution or a
+    // write blocked because the server is not reading.
+    HttpResponse send(const HttpRequest& request, std::stop_token stop = {}) {
+        return send_impl(request, 0, stop);
     }
 
     // Streaming SSE request — reads the response body incrementally, feeding
     // chunks through SseParser to the caller's callback. The callback receives
     // each SseEvent and returns true to continue or false to stop.
-    HttpResponse send_stream(const HttpRequest& request, SseCallbackFn callback) {
+    // `stop` is as for send().
+    HttpResponse send_stream(const HttpRequest& request, SseCallbackFn callback,
+                             std::stop_token stop = {}) {
+        if (stop.stop_requested()) return cancelled_response();
         HttpResponse response;
 
         auto parsed = parse_url(request.url);
@@ -901,12 +928,13 @@ public:
         PooledConnection guard(pool_, poolKey);
 
         auto exchange = perform_exchange(parsed, poolKey,
-                                         build_request(request, parsed), guard);
+                                         build_request(request, parsed), guard, stop);
         if (!exchange.error.empty()) {
             response.statusCode = 0;
             response.statusText = exchange.error;
             response.bodyComplete = false;
             response.bodyError = exchange.error;
+            response.cancelled = exchange.cancelled;
             return response;
         }
 
@@ -921,6 +949,7 @@ public:
         SseParser parser;
 
         auto sink = [&](std::string_view data) -> bool {
+            if (stop.stop_requested()) return false;
             if (captureBody) {
                 append_within_limit(response.body, data, stream_error_body_limit);
             }
@@ -932,21 +961,23 @@ public:
 
         finish_body(response, exchange, request.method,
                     /*maxBytes=*/std::numeric_limits<std::int64_t>::max(),
-                    sink, guard);
+                    sink, guard, stop);
         return response;
     }
 
     // Download URL to file with streaming progress.
     // Follows redirects. Calls onProgress periodically during body read.
     // isCancelled is checked after each block — return true to abort.
+    // `stop` is as for send(), and also ends the wait for the response head.
     DownloadToFileResult download_to_file(
         const std::string& url,
         const std::filesystem::path& destFile,
         DownloadProgressFn onProgress = nullptr,
-        std::function<bool()> isCancelled = nullptr)
+        std::function<bool()> isCancelled = nullptr,
+        std::stop_token stop = {})
     {
         return download_to_file_impl(url, destFile, std::move(onProgress),
-                                     std::move(isCancelled), 0);
+                                     std::move(isCancelled), 0, stop);
     }
 
     HttpClientConfig& config() { return config_; }
@@ -959,7 +990,17 @@ private:
         TlsSocket* sock { nullptr };
         ResponseHead head;
         std::string error;
+        bool cancelled { false };
     };
+
+    static HttpResponse cancelled_response() {
+        HttpResponse response;
+        response.statusText = "Cancelled";
+        response.bodyComplete = false;
+        response.bodyError = "Cancelled";
+        response.cancelled = true;
+        return response;
+    }
 
     std::string build_request(const HttpRequest& request, const ParsedUrl& parsed) const {
         std::string reqStr;
@@ -999,11 +1040,12 @@ private:
 
     // False on failure, with `error` set when there is more to say than that the
     // connection failed: a proxy that refused the tunnel says so in its own words.
-    bool open_connection(TlsSocket& sock, const ParsedUrl& parsed, std::string& error) {
+    bool open_connection(TlsSocket& sock, const ParsedUrl& parsed, std::string& error,
+                         std::stop_token stop) {
         if (config_.proxy.has_value()) {
             auto tunnel = proxy_tunnel(parse_proxy_url(config_.proxy.value()),
                                        parsed.host, parsed.port,
-                                       config_.connectTimeoutMs, config_.verifySsl);
+                                       config_.connectTimeoutMs, config_.verifySsl, stop);
             if (!tunnel.ok()) {
                 error = std::move(tunnel.error);
                 return false;
@@ -1028,8 +1070,17 @@ private:
     // request, so sending it again on a fresh connection is safe — once, and
     // only when no response byte has arrived. See `retryOnStaleConnection`.
     Exchange perform_exchange(const ParsedUrl& parsed, const std::string& poolKey,
-                              const std::string& reqStr, PooledConnection& guard) {
+                              const std::string& reqStr, PooledConnection& guard,
+                              std::stop_token stop = {}) {
+        // Drops the connection; a stop request outranks whatever went wrong.
+        auto fail = [&](std::string message) -> Exchange {
+            guard.drop();
+            if (stop.stop_requested()) return { nullptr, {}, "Cancelled", true };
+            return { nullptr, {}, std::move(message) };
+        };
+
         for (int attempt = 0; attempt < 2; ++attempt) {
+            if (stop.stop_requested()) return fail("");
             bool reused = false;
             TlsSocket* sock = nullptr;
 
@@ -1041,15 +1092,17 @@ private:
                 if (it != pool_.end()) pool_.erase(it);
                 auto [inserted, ok] = pool_.emplace(poolKey, TlsSocket{});
                 sock = &inserted->second;
+            }
+            sock->set_stop(stop);
+            if (!reused) {
                 std::string openError;
-                if (!open_connection(*sock, parsed, openError)) {
+                if (!open_connection(*sock, parsed, openError, stop)) {
                     // The proxy's refusal, else the TLS session's reason,
                     // else the TCP connection failed and there is no more to say.
                     std::string why = std::move(openError);
                     if (why.empty()) why = sock->error();
                     if (why.empty()) why = "Connection failed";
-                    guard.drop();
-                    return { nullptr, {}, std::move(why) };
+                    return fail(std::move(why));
                 }
             }
 
@@ -1065,8 +1118,7 @@ private:
             // connection therefore yields exactly one execution.
             if (!write_all(*sock, reqStr, config_.readTimeoutMs)) {
                 if (mayRetry) { guard.reset(); continue; }
-                guard.drop();
-                return { nullptr, {}, "Write failed" };
+                return fail("Write failed");
             }
 
             auto head = read_response_head(*sock, config_.readTimeoutMs);
@@ -1076,18 +1128,16 @@ private:
             // arrived the server has seen the request, and repeating it could
             // repeat its effect.
             if (mayRetry && !head.error().sawBytes) { guard.reset(); continue; }
-            guard.drop();
-            return { nullptr, {}, head.error().message };
+            return fail(head.error().message);
         }
-        guard.drop();
-        return { nullptr, {}, "No response" };
+        return fail("No response");
     }
 
     // Reads the body into `sink` and settles the pool guard by what the read
     // found. The single place that decides whether a connection is reusable.
     void finish_body(HttpResponse& response, Exchange& exchange, Method method,
                      std::int64_t maxBytes, const BodySink& sink,
-                     PooledConnection& guard) {
+                     PooledConnection& guard, std::stop_token stop = {}) {
         if (!response_has_body(method, exchange.head.statusCode)) {
             if (config_.keepAlive && !exchange.head.connectionClose) guard.keep();
             return;
@@ -1103,6 +1153,10 @@ private:
                 // Not an error, but bytes are still owed on the socket.
                 response.bodyComplete = false;
                 response.bodyError = "stopped by callback";
+                if (stop.stop_requested()) {
+                    response.bodyError = "cancelled";
+                    response.cancelled = true;
+                }
                 break;
             case BodyEnd::ClosedByPeer:
                 // The body ended where it said it would; the connection did too.
@@ -1110,11 +1164,17 @@ private:
             case BodyEnd::Truncated:
                 response.bodyComplete = false;
                 response.bodyError = outcome.error;
+                if (stop.stop_requested()) {
+                    response.bodyError = "cancelled";
+                    response.cancelled = true;
+                }
                 break;
         }
     }
 
-    HttpResponse send_impl(const HttpRequest& request, int redirectCount) {
+    HttpResponse send_impl(const HttpRequest& request, int redirectCount,
+                           std::stop_token stop) {
+        if (stop.stop_requested()) return cancelled_response();
         HttpResponse response;
 
         auto parsed = parse_url(request.url);
@@ -1128,12 +1188,13 @@ private:
         PooledConnection guard(pool_, poolKey);
 
         auto exchange = perform_exchange(parsed, poolKey,
-                                         build_request(request, parsed), guard);
+                                         build_request(request, parsed), guard, stop);
         if (!exchange.error.empty()) {
             response.statusCode = 0;
             response.statusText = exchange.error;
             response.bodyComplete = false;
             response.bodyError = exchange.error;
+            response.cancelled = exchange.cancelled;
             return response;
         }
 
@@ -1157,10 +1218,10 @@ private:
                         response.body.append(data);
                         return true;
                     },
-                    guard);
+                    guard, stop);
 
         // Follow 3xx redirects if configured.
-        if (config_.maxRedirects > 0 &&
+        if (config_.maxRedirects > 0 && !response.cancelled &&
             response.statusCode >= 300 && response.statusCode < 400 &&
             redirectCount < config_.maxRedirects) {
             std::string location = find_header(response.headers, "Location");
@@ -1181,7 +1242,7 @@ private:
                 // connection into the pool under this same key, and a guard
                 // still armed would delete it when this scope ends.
                 guard.drop();
-                return send_impl(redirectReq, redirectCount + 1);
+                return send_impl(redirectReq, redirectCount + 1, stop);
             }
         }
 
@@ -1193,9 +1254,15 @@ private:
         const std::filesystem::path& destFile,
         DownloadProgressFn onProgress,
         std::function<bool()> isCancelled,
-        int redirectCount)
+        int redirectCount,
+        std::stop_token stop)
     {
         DownloadToFileResult result;
+        if (stop.stop_requested()) {
+            result.error = "Cancelled";
+            result.cancelled = true;
+            return result;
+        }
 
         auto parsed = parse_url(url);
         if (parsed.scheme != "https") {
@@ -1212,9 +1279,10 @@ private:
         request.headers = { {"User-Agent", "tinyhttps/1.0"}, {"Accept", "*/*"} };
 
         auto exchange = perform_exchange(parsed, poolKey,
-                                         build_request(request, parsed), guard);
+                                         build_request(request, parsed), guard, stop);
         if (!exchange.error.empty()) {
             result.error = exchange.error;
+            result.cancelled = exchange.cancelled;
             return result;
         }
 
@@ -1239,6 +1307,11 @@ private:
                 } else {
                     guard.drop();
                 }
+                if (stop.stop_requested()) {
+                    result.error = "cancelled";
+                    result.cancelled = true;
+                    return result;
+                }
 
                 if (location.starts_with("/")) {
                     location = parsed.scheme + "://" + parsed.host +
@@ -1246,7 +1319,8 @@ private:
                                location;
                 }
                 return download_to_file_impl(location, destFile, std::move(onProgress),
-                                             std::move(isCancelled), redirectCount + 1);
+                                             std::move(isCancelled), redirectCount + 1,
+                                             stop);
             }
         }
 
@@ -1339,7 +1413,10 @@ private:
 
                 written += size;
                 if (onProgress) onProgress(totalBytes, written);
-                if (isCancelled && isCancelled()) { cancelled = true; return false; }
+                if ((isCancelled && isCancelled()) || stop.stop_requested()) {
+                    cancelled = true;
+                    return false;
+                }
                 return true;
             });
 
@@ -1357,9 +1434,12 @@ private:
                 result.error = cancelled ? "cancelled" : "stopped";
                 break;
             case BodyEnd::Truncated:
-                result.error = outcome.error;
+                // A wait that the stop token ended reads as a truncated body.
+                cancelled = stop.stop_requested();
+                result.error = cancelled ? "cancelled" : outcome.error;
                 break;
         }
+        result.cancelled = cancelled;
 
         // The destination's failure outranks whatever the switch recorded: a
         // stop that the file asked for is not a cancellation, and a body that
@@ -1367,6 +1447,7 @@ private:
         if (writeFailed) {
             result.error = write_failure();
             result.writeFailed = true;
+            result.cancelled = false;
         }
         return result;
     }

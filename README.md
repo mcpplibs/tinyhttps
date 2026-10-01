@@ -46,6 +46,35 @@ else                       { /* resp.body is all of it */ }
 `ok()` deliberately does not consult `bodyComplete`, so existing `if (res.ok())`
 means exactly what it did before.
 
+### Cancelling a request
+
+Pass a `std::stop_token` to `send`, `send_stream` or `download_to_file` and stop
+its source from another thread. The call returns within about 50 ms with
+`cancelled` set, and the connection is closed rather than pooled.
+
+```cpp
+HttpResponse response;
+std::jthread worker([&](std::stop_token stop) { response = client.send(request, stop); });
+// elsewhere:
+worker.request_stop();
+```
+
+If the status line had not arrived, `statusCode` is 0 and `statusText` is
+`Cancelled`; otherwise they are the server's and `bodyError` is `cancelled`.
+As with `bodyComplete`, `ok()` does not look at `cancelled`. A cancelled request
+is not retried and its redirect is not followed. `download_to_file` reports the
+same in `DownloadToFileResult::cancelled` and `error`, whether the token or its
+`isCancelled` callback asked.
+
+It covers connecting, a proxy's handshake, the TLS handshake, waiting for the
+response and reading it. Name resolution and a write blocked on a server that is
+not reading cannot be interrupted. Without a token nothing changes.
+
+With libc++ 20 or 22, a file that includes a standard header such as `<thread>`
+and then `import std;` fails to link `std::stop_source::request_stop()` (an
+inline helper of libc++'s is never emitted). Put `import std;` before the
+includes in that file, or use libc++ 23 or libstdc++.
+
 ### Configuration
 
 | field | default | what it decides |
@@ -152,21 +181,31 @@ beneath and not from this library:
   refused, and `statusText` says so.
 - `connectTimeoutMs` does not bound the TCP connect. `kal_net_connect` has no
   form that begins a connection and reports its outcome later, so the connect
-  completes or fails before it returns.
+  completes or fails before it returns. A stop token is checked before the
+  connect, not during it.
+- On Windows there is no name resolution: openkal has no resolver interface,
+  and musl's reads `/etc/resolv.conf`, which Windows does not have
+  ([openkal-musl#46](https://github.com/mcpplibs/openkal-musl/issues/46)). A URL
+  with an address in it connects.
+
+CI runs `examples/openkal` for x86_64-linux-gnu, x86_64-linux-musl,
+aarch64-linux-musl (under qemu) and x86_64-windows-musl (built on Linux, run on
+Windows). Locally,
+`mcpp run --toolchain llvm@22.1.8 --target x86_64-windows-musl` runs it under wine.
 
 ## 使用 mcpp 构建
 
 ### 添加依赖
 
 ```bash
-mcpp add tinyhttps@0.3.3
+mcpp add tinyhttps@0.3.4
 ```
 
 或在 `mcpp.toml` 中手动添加：
 
 ```toml
 [dependencies]
-tinyhttps = "0.3.3"
+tinyhttps = "0.3.4"
 ```
 
 ### 构建

@@ -11,7 +11,7 @@ version = "0.1.0"
 # sources either way. That is the claim this directory exists to check.
 [dependencies]
 tinyhttps            = { path = "../.." }
-openkal-llvm-runtime = "0.9.1"
+openkal-llvm-runtime = "0.15.2"
 
 [targets.smoke]
 kind = "bin"
@@ -22,3 +22,11 @@ main = "src/main.cpp"
 # dependency above.
 [toolchain]
 default = "llvm@22.1.8"
+
+# The programs of the other targets this example is run for, as mcpp-index's
+# openkal measurement runs them (tests/openkal/pins.toml there).
+[target.x86_64-windows-musl]
+runner = ["wine"]
+
+[target.aarch64-linux-musl]
+runner = ["qemu-aarch64"]

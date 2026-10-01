@@ -190,7 +190,9 @@ TEST_F(PoolTest, AContentLengthPastThirtyTwoBitsIsNotSilentlyZero) {
     // the width of the field and nothing else.
     // (`ABodyLargerThanTheConfiguredLimitIsRefused` covers the cap.)
     auto cfg = test_config();
-    cfg.maxResponseBodyBytes = std::numeric_limits<std::int64_t>::max();
+    // Parenthesised: <windows.h>, which the test servers include on Windows,
+    // defines a `max` macro.
+    cfg.maxResponseBodyBytes = (std::numeric_limits<std::int64_t>::max)();
     https::HttpClient client(cfg);
 
     auto first = client.send(get(server.url("/one")));

@@ -52,7 +52,7 @@ public:
 
     // Move constructor
     Socket(Socket&& other) noexcept
-        : fd_(other.fd_) {
+        : fd_(other.fd_), stop_(std::move(other.stop_)) {
         other.fd_ = INVALID_SOCKET_FD;
     }
 
@@ -61,6 +61,7 @@ public:
         if (this != &other) {
             close();
             fd_ = other.fd_;
+            stop_ = std::move(other.stop_);
             other.fd_ = INVALID_SOCKET_FD;
         }
         return *this;
@@ -69,6 +70,12 @@ public:
     [[nodiscard]] bool is_valid() const {
         return fd_ != INVALID_SOCKET_FD;
     }
+
+    // Once the token is stopped, every wait on this socket (connect included)
+    // ends within 50 ms and reports "not ready".
+    void set_stop(std::stop_token stop) { stop_ = std::move(stop); }
+
+    [[nodiscard]] bool stop_possible() const { return stop_.stop_possible(); }
 
     bool connect(const char* host, int port, int timeoutMs) {
         // Close existing connection if any
@@ -82,6 +89,7 @@ public:
         // musl-static build can't — its nameservers live in $PREFIX/etc/resolv.conf
         // which libc never reads — so fall back to a manual DNS query there.
         auto try_resolved = [&](const char* node, bool numeric) -> bool {
+            if (stop_.stop_requested()) return false;
             struct addrinfo hints{};
             hints.ai_family = AF_UNSPEC;
             hints.ai_socktype = SOCK_STREAM;
@@ -103,6 +111,7 @@ public:
             // Fall back to a manual DNS query when libc can't resolve (Termux:
             // nameservers live in $PREFIX/etc/resolv.conf, which libc ignores).
             auto try_manual = [&]() -> bool {
+                if (stop_.stop_requested()) return false;
                 // DNS must be snappy: a UDP query to a working resolver answers
                 // in well under a second. Cap it hard (independent of the much
                 // larger connect timeout) so an intermittently-dropped packet to
@@ -173,6 +182,7 @@ public:
     // Connect to the first reachable address in a resolved list.
     bool connect_addrinfo(struct addrinfo* result, int timeoutMs) {
         for (auto* rp = result; rp != nullptr; rp = rp->ai_next) {
+            if (stop_.stop_requested()) return false;
             SocketHandle fd = ::socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
             if (fd == INVALID_SOCKET_FD) {
                 continue;
@@ -232,7 +242,7 @@ public:
                 if (errno == EINPROGRESS) {
 #endif
                     // Wait for connection with timeout
-                    if (poll_fd(fd, timeoutMs, false)) {
+                    if (wait_fd(fd, timeoutMs, false)) {
                         int err = 0;
                         socklen_t len = sizeof(err);
                         if (::getsockopt(fd, SOL_SOCKET, SO_ERROR, reinterpret_cast<char*>(&err), &len) == 0 && err == 0) {
@@ -297,12 +307,12 @@ public:
 
     bool wait_readable(int timeoutMs) {
         if (!is_valid()) return false;
-        return poll_fd(fd_, timeoutMs, true);
+        return wait_fd(fd_, timeoutMs, true);
     }
 
     bool wait_writable(int timeoutMs) {
         if (!is_valid()) return false;
-        return poll_fd(fd_, timeoutMs, false);
+        return wait_fd(fd_, timeoutMs, false);
     }
 
     [[nodiscard]] SocketHandle native_handle() const {
@@ -331,6 +341,27 @@ public:
 
 private:
     SocketHandle fd_ = INVALID_SOCKET_FD;
+    std::stop_token stop_;
+
+    // poll_fd in slices while a token is attached. A negative timeout waits
+    // without limit. Not std::min: <winsock2.h> defines a `min` macro.
+    bool wait_fd(SocketHandle fd, int timeoutMs, bool forRead) const {
+        if (!stop_.stop_possible()) return poll_fd(fd, timeoutMs, forRead);
+        constexpr int slice = 50;
+        const auto deadline = std::chrono::steady_clock::now()
+                            + std::chrono::milliseconds(timeoutMs);
+        while (!stop_.stop_requested()) {
+            int wait = slice;
+            if (timeoutMs >= 0) {
+                const auto left = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    deadline - std::chrono::steady_clock::now()).count();
+                if (left < slice) wait = left > 0 ? static_cast<int>(left) : 0;
+            }
+            if (poll_fd(fd, wait, forRead)) return true;
+            if (timeoutMs >= 0 && std::chrono::steady_clock::now() >= deadline) return false;
+        }
+        return false;
+    }
 
     static bool set_non_blocking(SocketHandle fd, bool nonBlocking) {
 #ifdef TINYHTTPS_WINSOCK
