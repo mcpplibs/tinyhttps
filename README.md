@@ -7,7 +7,7 @@ Minimal C++23 HTTP/HTTPS client library with SSE (Server-Sent Events) streaming 
 - HTTP/HTTPS client with connection pooling (keep-alive)
 - SSE (Server-Sent Events) streaming
 - Streaming downloads to a file, with progress and cancellation
-- Proxy support (HTTP CONNECT)
+- Proxy support (HTTP CONNECT over plain HTTP or TLS, with Basic authentication; SOCKS5)
 - C++23 modules
 
 ## Usage
@@ -57,6 +57,40 @@ means exactly what it did before.
 | `maxRedirects` | 10 | 0 disables redirect following |
 | `maxResponseBodyBytes` | 64 MiB | the most `send()` will hold in memory; does not bound `download_to_file` or `send_stream` |
 | `retryOnStaleConnection` | true | resend once when a pooled connection turns out to have been closed while idle |
+| `proxy` | none | proxy URL, see below |
+
+### Proxies
+
+Set `proxy` to a URL and every request is tunnelled through it with `CONNECT`:
+
+```cpp
+cfg.proxy = "http://user:pass@proxy.example:3128";
+```
+
+The scheme is `http` (a bare `host:port` means the same), `https`, `socks5` or
+`socks5h`.
+
+An `https://` proxy is reached over TLS first, the `CONNECT` is sent inside that
+session, and the connection to the target is a second TLS session inside the
+tunnel; the two connections are set up alike, `verifySsl` included.
+
+With `socks5` the target's name is resolved here and the proxy is given an
+address; with `socks5h` the proxy is given the name and resolves it itself,
+which is what to use when the proxy is the only thing that can see the target's
+DNS. An address literal is sent as an address either way. The client offers the
+SOCKS5 proxy no authentication, plus the username/password method when the URL
+has credentials. SOCKS4 is not supported.
+
+Credentials are read from the URL and sent as Basic `Proxy-Authorization` (or as
+the SOCKS5 username and password); percent-escape any character that is special
+in a URL (`p%40ss` for `p@ss`). The port defaults to 8080, 443 for `https`, and
+1080 for the SOCKS schemes.
+
+When the proxy refuses the tunnel, `statusCode` is 0 and `statusText` carries
+its answer: `proxy rejected the credentials: 407 Proxy Authentication Required`,
+`proxy refused CONNECT: 403 Forbidden`, `proxy refused CONNECT: connection
+refused (SOCKS5 reply 5)`. Any other scheme (`socks4://`, say) fails the same
+way instead of being read as HTTP.
 
 ## Project templates
 
@@ -125,14 +159,14 @@ beneath and not from this library:
 ### 添加依赖
 
 ```bash
-mcpp add tinyhttps@0.3.2
+mcpp add tinyhttps@0.3.3
 ```
 
 或在 `mcpp.toml` 中手动添加：
 
 ```toml
 [dependencies]
-tinyhttps = "0.3.2"
+tinyhttps = "0.3.3"
 ```
 
 ### 构建

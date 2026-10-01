@@ -48,6 +48,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <cstdint>
 #include <cstring>
 #include <functional>
 #include <string>
@@ -206,6 +207,18 @@ public:
     // The request head this connection last read, for a handler that wants to
     // answer differently per path.
     const std::string& request() const { return request_; }
+
+    // Splices what this connection decrypts to 127.0.0.1:`port`, and what comes
+    // back from there into it, until either side ends. This is what makes the
+    // server a proxy for the proxy tests: after it answers a CONNECT, the
+    // client's next bytes are the start of a second TLS session, and this
+    // carries them to the real target untouched.
+    //
+    // With `gather` set, what comes back from the target is held until the
+    // target has been quiet for that long and then sent as one write, so
+    // several records the target wrote in a row reach the client inside a single
+    // record of this session.
+    void relay_to(int port, std::chrono::milliseconds gather = std::chrono::milliseconds::zero());
 
 private:
     friend class Server;
@@ -448,6 +461,46 @@ inline bool Conn::wait_readable() {
         if (ready < 0) return false;
     }
     return false;
+}
+
+inline void Conn::relay_to(int port, std::chrono::milliseconds gather) {
+    mbedtls_net_context target {};
+    mbedtls_net_init(&target);
+    if (mbedtls_net_connect(&target, "127.0.0.1", std::to_string(port).c_str(),
+                            MBEDTLS_NET_PROTO_TCP) != 0) {
+        return;
+    }
+    unsigned char buf[4096];
+    std::string back;
+    while (!server_.stopping()) {
+        if (mbedtls_ssl_get_bytes_avail(&ssl_) > 0
+            || mbedtls_net_poll(&net_, MBEDTLS_NET_POLL_READ, 10) > 0) {
+            int n = mbedtls_ssl_read(&ssl_, buf, sizeof buf);
+            if (n == MBEDTLS_ERR_SSL_WANT_READ || n == MBEDTLS_ERR_SSL_WANT_WRITE) continue;
+            if (n <= 0) break;
+            int sent = 0;
+            while (sent < n) {
+                int w = mbedtls_net_send(&target, buf + sent, static_cast<std::size_t>(n - sent));
+                if (w <= 0) { n = 0; break; }
+                sent += w;
+            }
+            if (n == 0) break;
+        }
+        if (mbedtls_net_poll(&target, MBEDTLS_NET_POLL_READ, 10) > 0) {
+            int n = mbedtls_net_recv(&target, buf, sizeof buf);
+            if (n <= 0) break;
+            back.assign(reinterpret_cast<char*>(buf), static_cast<std::size_t>(n));
+            while (gather.count() > 0 && back.size() < 8192
+                   && mbedtls_net_poll(&target, MBEDTLS_NET_POLL_READ,
+                                       static_cast<uint32_t>(gather.count())) > 0) {
+                n = mbedtls_net_recv(&target, buf, sizeof buf);
+                if (n <= 0) break;
+                back.append(reinterpret_cast<char*>(buf), static_cast<std::size_t>(n));
+            }
+            if (!write(back)) break;
+        }
+    }
+    mbedtls_net_free(&target);
 }
 
 inline void Conn::park(std::chrono::milliseconds limit) {

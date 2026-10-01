@@ -1,6 +1,14 @@
 # Changelog
 
-## Unreleased
+## 0.3.3
+
+**Behaviour change, and the reason for this release:** `verifySsl = true` (the
+default) now verifies the server certificate, and with no CA bundle to verify
+against a connection fails instead of going ahead unverified
+([#20](https://github.com/mcpplibs/tinyhttps/issues/20)). It is a patch release
+so that every dependency written `tinyhttps = "0.3.x"` receives it.
+
+### Certificate verification
 
 `verifySsl = true` now verifies the server certificate. The handshake used to
 complete with any certificate (a self-signed one, one for another host, an
@@ -20,6 +28,57 @@ result afterwards.
   certificate store that are usable for TLS servers are read. That code is built
   only for Windows Sockets targets, not for the musl one. MinGW builds need
   `-lcrypt32`, as they already need `-lws2_32`.
+* `examples/openkal` exits 1 when the certificate is refused; it used to read
+  every failure as an absence of network. CI builds and runs the Windows store
+  reader on windows-2022 under msvc and llvm (`tests/test_ca_store.cpp`).
+* MSVC builds link `bcrypt`, from which mbedTLS draws entropy; its package asks
+  for it as `-lbcrypt`, which link.exe does not read.
+
+### Proxies
+
+Proxy URLs carry credentials, and a proxy that refuses the tunnel says why.
+
+`parse_proxy_url` split a URL at the first colon, so `user:pass@host:3128` came
+out as host `user` and a port made of the digits of `pass@host:3128`. It also
+dropped the scheme, which meant `https://proxy:8443` was spoken to as plain
+HTTP. And every refusal, whatever the proxy said, reached the caller as
+`Connection failed`.
+
+* `user:password@` in the proxy URL is percent-decoded and sent as a Basic
+  `Proxy-Authorization` header on the `CONNECT`. Brackets around an IPv6 host
+  are understood, and a port that is not 1..65535 is 0 rather than a truncation.
+* `ProxyConfig` gains `scheme`, `hasCredentials`, `user` and `password`.
+  `parse_proxy_url` still returns the same type, and `host` and `port` keep
+  their meaning.
+* A refused tunnel is reported in `statusText`: `proxy rejected the credentials:
+  407 Proxy Authentication Required` when credentials were sent,
+  `proxy requires credentials: ...` when none were, `proxy refused CONNECT: ...`
+  for any other status. Any 2xx answer opens the tunnel; before, only 200 did.
+* A scheme this library does not speak is an error (`proxy: unsupported scheme
+  'socks4'`) where it used to be read as HTTP.
+* New `proxy_tunnel` returns the tunnel together with the reason it could not
+  be made. `proxy_connect` keeps its signature and calls it, so it also accepts
+  any 2xx answer now.
+* An `https://` proxy URL is spoken to over TLS: the session to the proxy
+  carries the `CONNECT`, and the session to the target runs inside the tunnel.
+  `TlsSocket` can now run over another `TlsSocket` (`connect_over` takes the
+  lower session), and its `wait_readable` asks that session rather than the
+  descriptor, because the bytes may already be decrypted there. The proxy
+  connection is set up like the one to the target, `verifySsl` included. The
+  default port for `https` is 443.
+* SOCKS5 proxies: `socks5://` resolves the target's name here and sends the
+  proxy an address, `socks5h://` sends the name. An address literal is sent as
+  an address in both. The client offers no authentication, plus the
+  username/password method when the URL has credentials. Failures are reported
+  in `statusText` the same way as for an HTTP proxy. The default port is 1080.
+  SOCKS4 is not supported and, like any unknown scheme, is an error.
+* `Socket::resolve_address` returns the address a name resolves to as raw bytes.
+* The connection to an `https://` proxy is verified like the connection to the
+  target, and a refusal names both the hop and the reason, for example
+  `proxy: could not open a TLS connection to proxy:443: certificate
+  verification failed: ...`. The CONNECT, and any credentials, are sent only
+  after the proxy's certificate has verified.
+* A failed handshake inside a tunnel closes the tunnel's session as well.
 
 ## 0.3.2
 

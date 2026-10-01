@@ -128,6 +128,48 @@ public:
         }
     }
 
+    // The first address `host` resolves to, as network-order bytes: four for
+    // IPv4, sixteen for IPv6, none when it does not resolve. IPv4 wins when both
+    // exist, which is what a SOCKS5 proxy of any age can be asked for.
+    // `numericOnly` accepts an address literal and nothing else, with no lookup.
+    static std::vector<unsigned char> resolve_address(const char* host, bool numericOnly = false) {
+        struct addrinfo hints{};
+        hints.ai_family = AF_UNSPEC;
+        hints.ai_socktype = SOCK_STREAM;
+        if (numericOnly) hints.ai_flags = AI_NUMERICHOST;
+
+        std::vector<unsigned char> bytes;
+        struct addrinfo* result = nullptr;
+        if (::getaddrinfo(host, nullptr, &hints, &result) == 0 && result != nullptr) {
+            for (auto* rp = result; rp != nullptr; rp = rp->ai_next) {
+                if (rp->ai_family == AF_INET) {
+                    auto* in = reinterpret_cast<unsigned char*>(
+                        &reinterpret_cast<struct sockaddr_in*>(rp->ai_addr)->sin_addr);
+                    bytes.assign(in, in + 4);
+                    break;
+                }
+                if (rp->ai_family == AF_INET6 && bytes.empty()) {
+                    auto* in = reinterpret_cast<unsigned char*>(
+                        &reinterpret_cast<struct sockaddr_in6*>(rp->ai_addr)->sin6_addr);
+                    bytes.assign(in, in + 16);
+                }
+            }
+            ::freeaddrinfo(result);
+        }
+
+        // As in `connect`: where libc has no resolver configuration (Termux),
+        // fall back to a manual query.
+        if constexpr (!platform::uses_winsock) {
+            if (bytes.empty() && !numericOnly) {
+                for (const auto& ip : platform::resolve_fallback(host, 2500)) {
+                    bytes = resolve_address(ip.c_str(), true);
+                    if (!bytes.empty()) break;
+                }
+            }
+        }
+        return bytes;
+    }
+
     // Connect to the first reachable address in a resolved list.
     bool connect_addrinfo(struct addrinfo* result, int timeoutMs) {
         for (auto* rp = result; rp != nullptr; rp = rp->ai_next) {
