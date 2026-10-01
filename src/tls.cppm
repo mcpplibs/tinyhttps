@@ -7,6 +7,14 @@ module;
 #include <mbedtls/error.h>
 #include <mbedtls/net_sockets.h>
 
+// mbedTLS draws its entropy from BCryptGenRandom on Windows. Its package asks
+// for the library as `-lbcrypt`, which link.exe does not read, so the request is
+// made here in the form every linker for this target reads, as socket.cppm does
+// for ws2_32.
+#if defined(_WIN32) && !defined(TINYHTTPS_POSIX_SOCKETS)
+#pragma comment(lib, "bcrypt.lib")
+#endif
+
 export module mcpplibs.tinyhttps:tls;
 
 import :socket;
