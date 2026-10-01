@@ -3,8 +3,9 @@
 ## 0.3.4
 
 A request in flight can be abandoned from another thread. Everything is added
-and nothing changes without a token, so it is a patch release that every
-dependency written `tinyhttps = "0.3.x"` receives.
+and nothing changes without a token, so it is a patch release: a dependency
+written as a caret range, `tinyhttps = "^0.3.0"`, resolves to it. A bare version
+such as `"0.3.3"` is exact in mcpp and stays where it is.
 
 ### Cancellation
 

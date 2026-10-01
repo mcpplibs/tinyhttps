@@ -13,7 +13,7 @@
 ## 0. 为什么是 0.3.4
 
 - 只新增，不改已有行为：`send`、`send_stream`、`download_to_file` 都只加了尾部默认参数；`HttpResponse` 和 `DownloadToFileResult` 各在末尾追加一个字段；不传 token 时逐字节不变（不变式 I3）。
-- 依赖写成 `tinyhttps = "0.3.x"` 的项目会自动解析到它，这是 0.3.3 立下的规则：让现有依赖不改清单就能收到。mcpp-index 的 `tests/examples/tinyhttps` 写的是 `0.3.1`，也会解析到它。
+- 依赖写成 caret 范围 `tinyhttps = "^0.3.0"` 的项目会自动解析到它。**更正（发布后实测）：** mcpp 里裸写的 `"0.3.1"` 是精确版本，不会解析到 0.3.4；`"0.3.x"` 不是 mcpp 的合法写法。0.3.3 的发布说明里也沿用了这个说法。已用已发布的 index 实测：`"^0.3.1"` 在 GLOBAL 和 CN 两个源下都解析到 0.3.4。
 - 唯一的源码不兼容点是对 `&HttpClient::send` 取成员函数指针（参数个数变了）。在 CHANGELOG 里点名说明。
 
 ## 1. 八个视角
@@ -93,9 +93,9 @@ T0 计划（本文）+ 设计文档纳入 PR
 
 ## 6. 验收
 
-- [ ] PR #23 的 CI 全绿（上表全部 job）
-- [ ] 自审：H1、M1、M2、D1、D2 全部落地；PR 描述更新
-- [ ] squash 合入；tag `0.3.4`；GitHub release
-- [ ] gitcode 上的 `tinyhttps-0.3.4.tar.gz` 与 GitHub archive 的 sha256 一致
-- [ ] mcpp-index 合入；`validate` 和 `openkal-compat`（tinyhttps 这一项）通过
-- [ ] 新建项目用已发布的 index 解析到 0.3.4，GLOBAL 和 CN 两个源都能构建并运行
+- [x] PR #23 的 CI 全绿（10 个 job，`10e28b0`）
+- [x] 自审：H1、M1、M2、D1、D2 全部落地；PR 描述更新
+- [x] squash 合入（`156edeb`）；tag `0.3.4`；GitHub release
+- [x] gitcode 上的 `tinyhttps-0.3.4.tar.gz` 与 GitHub archive 的 sha256 一致（`26e0e496…41e9`）
+- [x] mcpp-index 合入（mcpplibs/mcpp-index#504）；`validate` 和 `openkal-compat`（tinyhttps 这一项，四个 target 均为 runs）通过
+- [x] 新建项目用已发布的 index 解析到 0.3.4（`"^0.3.1"`），GLOBAL 和 CN 两个源都能构建并运行，并对 httpbin 做了真实的进行中取消（301 ms）
