@@ -388,11 +388,11 @@ export ProxyTunnel proxy_tunnel(const ProxyConfig& proxy,
 // say why it failed; `proxy_tunnel` can.
 export Socket proxy_connect(std::string_view proxyHost, int proxyPort,
                             std::string_view targetHost, int targetPort,
-                            int timeoutMs, std::stop_token stop = {}) {
+                            int timeoutMs) {
     ProxyConfig proxy;
     proxy.host = std::string(proxyHost);
     proxy.port = proxyPort;
-    auto tunnel = proxy_tunnel(proxy, targetHost, targetPort, timeoutMs, true, stop);
+    auto tunnel = proxy_tunnel(proxy, targetHost, targetPort, timeoutMs);
     return std::move(tunnel.socket);
 }
 

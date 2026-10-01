@@ -15,6 +15,21 @@ module;
 #pragma comment(lib, "bcrypt.lib")
 #endif
 
+// WHERE THE C LIBRARY IS musl, THE ENTROPY IS THE C LIBRARY'S.
+//
+// mbedTLS's own platform source asks the kernel through `getrandom` only where
+// it recognises glibc (`entropy_poll.c`: `__linux__ && __GLIBC__`); with musl it
+// opens `/dev/urandom`. Above openkal that file is not a thing the C library can
+// promise — openkal reaches entropy through its own `openkal.random` interface,
+// and openkal-musl answers `getrandom` with it — so on x86_64-windows-musl every
+// handshake failed before it began, with "CTR_DRBG - The entropy source failed".
+// musl's `getentropy` is `getrandom` underneath on every system it runs on,
+// which is the source mbedTLS would have chosen had it known. The macro comes
+// from mcpp.toml's `cfg(c-abi = "musl")`, because musl defines none of its own.
+#ifdef TINYHTTPS_GETENTROPY
+#include <unistd.h>
+#endif
+
 export module mcpplibs.tinyhttps:tls;
 
 import :socket;
@@ -89,6 +104,19 @@ static int bio_recv(void* ctx, unsigned char* buf, size_t len) {
     }
     return ret;   // 0 means end of stream; mbedtls turns it into SSL_CONN_EOF
 }
+
+#ifdef TINYHTTPS_GETENTROPY
+// `getentropy` gives at most 256 bytes a call.
+static int c_library_entropy(void*, unsigned char* out, size_t len) {
+    while (len > 0) {
+        const size_t n = len < 256 ? len : 256;
+        if (::getentropy(out, n) != 0) return MBEDTLS_ERR_ENTROPY_SOURCE_FAILED;
+        out += n;
+        len -= n;
+    }
+    return 0;
+}
+#endif
 
 static std::string mbedtls_message(int ret) {
     char buf[200];
@@ -165,7 +193,18 @@ public:
     [[nodiscard]] const std::string& error() const { return error_; }
 
     // Call before connect(); it covers the handshake and every later wait.
-    void set_stop(std::stop_token stop) { socket_.set_stop(std::move(stop)); }
+    //
+    // THE TOKEN BELONGS TO THE SOCKET AT THE BOTTOM, AND ONLY THERE. Every wait
+    // ends in a `Socket` — this session's own, or, inside an https:// proxy's
+    // tunnel, the one beneath `lower_` — so that is where it is set. Setting
+    // only `socket_` left a reused tunnel holding the token of the call that
+    // opened it: a later call could not be cancelled, and once that first
+    // token was stopped every wait failed at once and the stale-connection
+    // retry sent a POST that had already arrived a second time.
+    void set_stop(std::stop_token stop) {
+        if (lower_) lower_->set_stop(stop);
+        socket_.set_stop(std::move(stop));
+    }
 
     // Connect over an already-established Socket (e.g. a proxy tunnel).
     // Takes ownership of the socket and performs TLS handshake on top of it.
@@ -336,7 +375,11 @@ private:
         state_ = std::make_unique<TlsState>();
 
         int ret = mbedtls_ctr_drbg_seed(
+#ifdef TINYHTTPS_GETENTROPY
+            &state_->ctr_drbg, c_library_entropy, nullptr,
+#else
             &state_->ctr_drbg, mbedtls_entropy_func, &state_->entropy,
+#endif
             nullptr, 0);
         if (ret != 0) return fail(mbedtls_message(ret));
 

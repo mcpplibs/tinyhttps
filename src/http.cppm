@@ -149,6 +149,12 @@ export struct DownloadToFileResult {
     // failure downstream of a truncated file otherwise blames the wrong party.
     bool writeFailed { false };
 
+    // True when the caller abandoned the transfer: `isCancelled` returned true
+    // or the stop token was stopped. `error` is then "Cancelled" if no status
+    // line had arrived and "cancelled" if one had, as for `HttpResponse`. A
+    // destination that failed first is reported as that instead.
+    bool cancelled { false };
+
     bool ok() const { return statusCode >= 200 && statusCode < 300 && error.empty(); }
 };
 
@@ -842,7 +848,16 @@ public:
 
     // Call only where the body was read to the end its framing declared and the
     // response did not ask for the connection to close.
-    void keep() noexcept { armed_ = false; }
+    //
+    // A connection in the pool carries no stop token. The call that used it
+    // set its own (`perform_exchange`), and the caller may stop that token
+    // after this call has returned — a `std::jthread` does so in its
+    // destructor — which must not reach whatever takes the connection next.
+    void keep() noexcept {
+        if (!armed_) return;
+        armed_ = false;
+        if (auto it = pool_.find(key_); it != pool_.end()) it->second.set_stop({});
+    }
 
     // Drop now rather than at the end of the scope. Idempotent, and a no-op
     // after `keep()`.
@@ -953,14 +968,16 @@ public:
     // Download URL to file with streaming progress.
     // Follows redirects. Calls onProgress periodically during body read.
     // isCancelled is checked after each block — return true to abort.
+    // `stop` is as for send(), and also ends the wait for the response head.
     DownloadToFileResult download_to_file(
         const std::string& url,
         const std::filesystem::path& destFile,
         DownloadProgressFn onProgress = nullptr,
-        std::function<bool()> isCancelled = nullptr)
+        std::function<bool()> isCancelled = nullptr,
+        std::stop_token stop = {})
     {
         return download_to_file_impl(url, destFile, std::move(onProgress),
-                                     std::move(isCancelled), 0);
+                                     std::move(isCancelled), 0, stop);
     }
 
     HttpClientConfig& config() { return config_; }
@@ -1237,9 +1254,15 @@ private:
         const std::filesystem::path& destFile,
         DownloadProgressFn onProgress,
         std::function<bool()> isCancelled,
-        int redirectCount)
+        int redirectCount,
+        std::stop_token stop)
     {
         DownloadToFileResult result;
+        if (stop.stop_requested()) {
+            result.error = "Cancelled";
+            result.cancelled = true;
+            return result;
+        }
 
         auto parsed = parse_url(url);
         if (parsed.scheme != "https") {
@@ -1256,9 +1279,10 @@ private:
         request.headers = { {"User-Agent", "tinyhttps/1.0"}, {"Accept", "*/*"} };
 
         auto exchange = perform_exchange(parsed, poolKey,
-                                         build_request(request, parsed), guard);
+                                         build_request(request, parsed), guard, stop);
         if (!exchange.error.empty()) {
             result.error = exchange.error;
+            result.cancelled = exchange.cancelled;
             return result;
         }
 
@@ -1283,6 +1307,11 @@ private:
                 } else {
                     guard.drop();
                 }
+                if (stop.stop_requested()) {
+                    result.error = "cancelled";
+                    result.cancelled = true;
+                    return result;
+                }
 
                 if (location.starts_with("/")) {
                     location = parsed.scheme + "://" + parsed.host +
@@ -1290,7 +1319,8 @@ private:
                                location;
                 }
                 return download_to_file_impl(location, destFile, std::move(onProgress),
-                                             std::move(isCancelled), redirectCount + 1);
+                                             std::move(isCancelled), redirectCount + 1,
+                                             stop);
             }
         }
 
@@ -1383,7 +1413,10 @@ private:
 
                 written += size;
                 if (onProgress) onProgress(totalBytes, written);
-                if (isCancelled && isCancelled()) { cancelled = true; return false; }
+                if ((isCancelled && isCancelled()) || stop.stop_requested()) {
+                    cancelled = true;
+                    return false;
+                }
                 return true;
             });
 
@@ -1401,9 +1434,12 @@ private:
                 result.error = cancelled ? "cancelled" : "stopped";
                 break;
             case BodyEnd::Truncated:
-                result.error = outcome.error;
+                // A wait that the stop token ended reads as a truncated body.
+                cancelled = stop.stop_requested();
+                result.error = cancelled ? "cancelled" : outcome.error;
                 break;
         }
+        result.cancelled = cancelled;
 
         // The destination's failure outranks whatever the switch recorded: a
         // stop that the file asked for is not a cancellation, and a body that
@@ -1411,6 +1447,7 @@ private:
         if (writeFailed) {
             result.error = write_failure();
             result.writeFailed = true;
+            result.cancelled = false;
         }
         return result;
     }
