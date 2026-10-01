@@ -1,26 +1,63 @@
 # Changelog
 
-## Unreleased
+## 0.3.4
 
-`send` and `send_stream` take an optional `std::stop_token`, so another thread
-can abandon a request that is in flight.
+A request in flight can be abandoned from another thread. Everything is added
+and nothing changes without a token, so it is a patch release that every
+dependency written `tinyhttps = "0.3.x"` receives.
 
-* When the token is stopped the call returns within about 50 ms with
-  `HttpResponse::cancelled` set, and the connection is closed instead of being
-  returned to the pool. It covers connect, the exchange with an HTTP, https or
-  SOCKS5 proxy, the TLS handshake, waiting for the response head, reading the
-  body and the gaps between streaming callbacks.
-* Before the status line arrives the response is `statusCode` 0 with
-  `statusText` and `bodyError` `Cancelled`. After it, `statusCode` is the
-  server's and `bodyError` is `cancelled`. A cancelled request is not retried on
-  a new connection and its redirect is not followed. `ok()` does not look at
-  `cancelled`, as it does not look at `bodyComplete`.
+### Cancellation
+
+`send`, `send_stream` and `download_to_file` take an optional `std::stop_token`
+as their last argument ([#23](https://github.com/mcpplibs/tinyhttps/pull/23)).
+
+* When the token is stopped the call returns within about 50 ms, and the
+  connection is closed instead of being returned to the pool. It covers the
+  connect, the exchange with an HTTP, https or SOCKS5 proxy, the TLS handshake,
+  waiting for the response head, reading the body and the gaps between
+  streaming callbacks.
+* `HttpResponse::cancelled` says so. Before the status line arrives the response
+  is `statusCode` 0 with `statusText` and `bodyError` `Cancelled`; after it,
+  `statusCode` is the server's and `bodyError` is `cancelled`. `ok()` does not
+  look at `cancelled`, as it does not look at `bodyComplete`.
+* `DownloadToFileResult::cancelled` is the same for a download, set by the token
+  or by `isCancelled`, with `error` `Cancelled` or `cancelled` as above. A
+  destination that failed first is reported as `writeFailed` instead.
+* A cancelled request is not retried on a new connection, and its redirect is
+  not followed.
+* A token belongs to its call. It is set on the socket at the bottom of the
+  connection (through an https:// proxy, the one beneath the tunnel) and taken
+  off when the connection goes back to the pool, so a token stopped after its
+  call returned — `std::jthread` stops its own in its destructor — does not
+  reach the next call on that connection.
 * Not covered: name resolution (`getaddrinfo`, and the lookup `socks5://` does
   for the target), and a write that is blocked because the server is not
-  reading. Without a token nothing changes.
-* `proxy_connect` and `proxy_tunnel` take the token as a trailing default
-  argument. `Socket` and `TlsSocket` gain `set_stop`, and `Socket` gains
-  `stop_possible`.
+  reading.
+* `proxy_tunnel` takes the token as a trailing default argument. `Socket` and
+  `TlsSocket` gain `set_stop`, and `Socket` gains `stop_possible`.
+* A call through a pointer to `HttpClient::send`, `send_stream` or
+  `download_to_file` needs the new parameter in the pointer's type; a call by
+  name compiles unchanged.
+* libc++ 20 and 22 fail to link `std::stop_source::request_stop()` in a file
+  that includes a standard header such as `<thread>` before `import std;`.
+  Import first in such a file; libc++ 23 and libstdc++ are not affected.
+
+### openkal
+
+* Where the C library is musl, the TLS random generator is seeded from musl's
+  `getentropy` rather than from mbedTLS's reading of `/dev/urandom`. Above
+  openkal on x86_64-windows-musl that file does not exist, and every handshake
+  failed with "CTR_DRBG - The entropy source failed".
+* `examples/openkal` follows mcpp-index's openkal measurement: runtime 0.15.2,
+  and a cancellation check against a local listener that needs no network. CI
+  runs it on x86_64-linux-gnu, x86_64-linux-musl, aarch64-linux-musl (qemu) and
+  x86_64-windows-musl (wine).
+
+### CI
+
+* Linux runs every test under gcc 16 and under llvm 22 with libc++.
+* macOS (arm64, llvm 22) runs every test. Nothing ran on macOS before.
+* Windows (msvc and llvm 20) runs the hermetic tests as well as `test_ca_store`.
 
 ## 0.3.3
 
