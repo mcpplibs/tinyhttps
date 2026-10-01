@@ -997,14 +997,18 @@ private:
         return reqStr;
     }
 
-    bool open_connection(TlsSocket& sock, const ParsedUrl& parsed) {
+    // False on failure, with `error` set when there is more to say than that the
+    // connection failed: a proxy that refused the tunnel says so in its own words.
+    bool open_connection(TlsSocket& sock, const ParsedUrl& parsed, std::string& error) {
         if (config_.proxy.has_value()) {
-            auto proxyConf = parse_proxy_url(config_.proxy.value());
-            auto tunnel = proxy_connect(proxyConf.host, proxyConf.port,
-                                        parsed.host, parsed.port,
-                                        config_.connectTimeoutMs);
-            if (!tunnel.is_valid()) return false;
-            return sock.connect_over(std::move(tunnel), parsed.host.c_str(),
+            auto tunnel = proxy_tunnel(parse_proxy_url(config_.proxy.value()),
+                                       parsed.host, parsed.port,
+                                       config_.connectTimeoutMs);
+            if (!tunnel.ok()) {
+                error = std::move(tunnel.error);
+                return false;
+            }
+            return sock.connect_over(std::move(tunnel.socket), parsed.host.c_str(),
                                      config_.verifySsl);
         }
         return sock.connect(parsed.host.c_str(), parsed.port,
@@ -1033,9 +1037,10 @@ private:
                 if (it != pool_.end()) pool_.erase(it);
                 auto [inserted, ok] = pool_.emplace(poolKey, TlsSocket{});
                 sock = &inserted->second;
-                if (!open_connection(*sock, parsed)) {
+                std::string openError;
+                if (!open_connection(*sock, parsed, openError)) {
                     guard.drop();
-                    return { nullptr, {}, "Connection failed" };
+                    return { nullptr, {}, openError.empty() ? "Connection failed" : openError };
                 }
             }
 

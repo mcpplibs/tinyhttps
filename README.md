@@ -7,7 +7,7 @@ Minimal C++23 HTTP/HTTPS client library with SSE (Server-Sent Events) streaming 
 - HTTP/HTTPS client with connection pooling (keep-alive)
 - SSE (Server-Sent Events) streaming
 - Streaming downloads to a file, with progress and cancellation
-- Proxy support (HTTP CONNECT)
+- Proxy support (HTTP CONNECT, with Basic authentication)
 - C++23 modules
 
 ## Usage
@@ -57,6 +57,25 @@ means exactly what it did before.
 | `maxRedirects` | 10 | 0 disables redirect following |
 | `maxResponseBodyBytes` | 64 MiB | the most `send()` will hold in memory; does not bound `download_to_file` or `send_stream` |
 | `retryOnStaleConnection` | true | resend once when a pooled connection turns out to have been closed while idle |
+| `proxy` | none | proxy URL, see below |
+
+### Proxies
+
+Set `proxy` to a URL and every request is tunnelled through it with `CONNECT`:
+
+```cpp
+cfg.proxy = "http://user:pass@proxy.example:3128";
+```
+
+The scheme is `http`, and a bare `host:port` means the same. Credentials are
+read from the URL and sent as Basic `Proxy-Authorization`; percent-escape any
+character that is special in a URL (`p%40ss` for `p@ss`). The port defaults to
+8080.
+
+When the proxy refuses the tunnel, `statusCode` is 0 and `statusText` carries
+its answer: `proxy rejected the credentials: 407 Proxy Authentication Required`,
+`proxy refused CONNECT: 403 Forbidden`. Any other scheme (`socks4://`, say)
+fails the same way instead of being read as HTTP.
 
 ## Project templates
 

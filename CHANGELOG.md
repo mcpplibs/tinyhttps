@@ -1,5 +1,34 @@
 # Changelog
 
+## Unreleased
+
+Proxy URLs carry credentials, and a proxy that refuses the tunnel says why.
+
+`parse_proxy_url` split a URL at the first colon, so `user:pass@host:3128` came
+out as host `user` and a port made of the digits of `pass@host:3128`. It also
+dropped the scheme, which meant `https://proxy:8443` was spoken to as plain
+HTTP. And every refusal, whatever the proxy said, reached the caller as
+`Connection failed`.
+
+* `user:password@` in the proxy URL is percent-decoded and sent as a Basic
+  `Proxy-Authorization` header on the `CONNECT`. Brackets around an IPv6 host
+  are understood, and a port that is not 1..65535 is 0 rather than a truncation.
+* `ProxyConfig` gains `scheme`, `hasCredentials`, `user` and `password`.
+  `parse_proxy_url` still returns the same type, and `host` and `port` keep
+  their meaning.
+* A refused tunnel is reported in `statusText`: `proxy rejected the credentials:
+  407 Proxy Authentication Required` when credentials were sent,
+  `proxy requires credentials: ...` when none were, `proxy refused CONNECT: ...`
+  for any other status. Any 2xx answer opens the tunnel; before, only 200 did.
+* A scheme other than `http` is an error (`proxy: unsupported scheme
+  'socks4'`) where it used to be read as HTTP. That also ends a habit that
+  happened to work: a proxy that answers HTTP and SOCKS on one port could be
+  used by writing `socks5://` or `https://` in front of it, because the scheme
+  was ignored.
+* New `proxy_tunnel` returns the tunnel together with the reason it could not
+  be made. `proxy_connect` keeps its signature and calls it, so it also accepts
+  any 2xx answer now.
+
 ## 0.3.2
 
 `download_to_file` no longer reports success for a file the disk did not keep.
