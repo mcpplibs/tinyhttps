@@ -13,9 +13,11 @@ export struct ProxyConfig {
     std::string host;
     int port { 8080 };
 
-    // Lower case: "http", or "https" for a proxy that is itself reached over
-    // TLS. "http" when the URL has no scheme, which is how a bare `host:port`
-    // has always been read.
+    // Lower case: "http", "https" for a proxy that is itself reached over TLS,
+    // "socks5" or "socks5h". "http" when the URL has no scheme, which is how a
+    // bare `host:port` has always been read. With "socks5" this library
+    // resolves the target's name and gives the proxy an address; with "socks5h"
+    // it gives the proxy the name.
     std::string scheme { "http" };
 
     // From `user:password@` in the URL, percent-decoded. A URL with `@` and no
@@ -51,7 +53,8 @@ static std::string percent_decode(std::string_view in) {
 
 // Parse "[scheme://][user[:password]@]host[:port]". A path, query or fragment
 // after the authority is ignored. IPv6 literals are written in brackets. The
-// port defaults to 443 for https and to 8080 otherwise.
+// port defaults to 443 for https, 1080 for socks5 and socks5h, and 8080
+// otherwise.
 export ProxyConfig parse_proxy_url(std::string_view url) {
     ProxyConfig config;
 
@@ -98,6 +101,7 @@ export ProxyConfig parse_proxy_url(std::string_view url) {
     }
 
     if (config.scheme == "https") config.port = 443;
+    if (config.scheme.starts_with("socks")) config.port = 1080;
 
     if (hasPort && !portStr.empty()) {
         // Anything but 1..65535 becomes 0, which no connect will accept.
@@ -212,6 +216,121 @@ static std::string http_connect(Stream& sock, const ProxyConfig& proxy,
     return "proxy: response to CONNECT has too many headers";
 }
 
+// SOCKS5 (RFC 1928), with the username/password method of RFC 1929.
+
+static bool read_exact(Socket& sock, unsigned char* buf, std::size_t n, int timeoutMs) {
+    std::size_t got = 0;
+    while (got < n) {
+        if (!sock.wait_readable(timeoutMs)) return false;
+        int ret = sock.read(reinterpret_cast<char*>(buf) + got, static_cast<int>(n - got));
+        if (ret <= 0) return false;   // 0 is the proxy closing the connection
+        got += static_cast<std::size_t>(ret);
+    }
+    return true;
+}
+
+static std::string_view socks5_reply_text(unsigned char code) {
+    switch (code) {
+        case 1: return "general failure";
+        case 2: return "connection not allowed by ruleset";
+        case 3: return "network unreachable";
+        case 4: return "host unreachable";
+        case 5: return "connection refused";
+        case 6: return "TTL expired";
+        case 7: return "command not supported";
+        case 8: return "address type not supported";
+    }
+    return "unknown error";
+}
+
+// Returns an error message, or an empty string once the proxy has connected to
+// the target and the stream is the tunnel.
+static std::string socks5_connect(Socket& sock, const ProxyConfig& proxy,
+                                  std::string_view host, int port, int timeoutMs) {
+    const bool remoteDns = proxy.scheme == "socks5h";
+    const std::string hostStr(host);
+
+    // Everything that can be refused before a byte is sent is refused first.
+    if (proxy.hasCredentials && (proxy.user.size() > 255 || proxy.password.size() > 255)) {
+        return "proxy: SOCKS5 credentials are limited to 255 bytes each";
+    }
+    // An address literal is always sent as an address; a name is sent as a name
+    // for socks5h and resolved here for socks5.
+    auto address = Socket::resolve_address(hostStr.c_str(), /*numericOnly=*/true);
+    if (address.empty() && remoteDns) {
+        if (host.empty() || host.size() > 255) return "proxy: host name does not fit a SOCKS5 request";
+    } else if (address.empty()) {
+        address = Socket::resolve_address(hostStr.c_str());
+        if (address.empty()) return "proxy: could not resolve " + hostStr;
+    }
+
+    std::string greeting = proxy.hasCredentials ? std::string("\x05\x02\x00\x02", 4)
+                                                : std::string("\x05\x01\x00", 3);
+    if (!write_all(sock, greeting, timeoutMs)) return "proxy: could not send the SOCKS5 greeting";
+
+    unsigned char choice[2];
+    if (!read_exact(sock, choice, 2, timeoutMs)) return "proxy: no SOCKS5 response";
+    if (choice[0] != 5) return "proxy: not a SOCKS5 proxy";
+    if (choice[1] == 0xFF) {
+        return proxy.hasCredentials
+            ? "proxy: SOCKS5 proxy accepts neither no authentication nor a username and password"
+            : "proxy requires credentials: no acceptable SOCKS5 authentication method";
+    }
+    if (choice[1] == 2 && proxy.hasCredentials) {
+        std::string auth = "\x01";
+        auth += static_cast<char>(proxy.user.size());
+        auth += proxy.user;
+        auth += static_cast<char>(proxy.password.size());
+        auth += proxy.password;
+        unsigned char status[2];
+        if (!write_all(sock, auth, timeoutMs) || !read_exact(sock, status, 2, timeoutMs)) {
+            return "proxy: no response to the SOCKS5 username and password";
+        }
+        if (status[1] != 0) return "proxy rejected the credentials (SOCKS5 status " + std::to_string(status[1]) + ")";
+    } else if (choice[1] != 0) {
+        return "proxy: SOCKS5 proxy chose an authentication method that was not offered";
+    }
+
+    std::string request("\x05\x01\x00", 3);
+    if (address.empty()) {
+        request += '\x03';
+        request += static_cast<char>(host.size());
+        request += host;
+    } else {
+        request += address.size() == 4 ? '\x01' : '\x04';
+        request.append(reinterpret_cast<const char*>(address.data()), address.size());
+    }
+    request += static_cast<char>(port >> 8);
+    request += static_cast<char>(port & 0xFF);
+    if (!write_all(sock, request, timeoutMs)) return "proxy: could not send the SOCKS5 request";
+
+    unsigned char reply[4];
+    if (!read_exact(sock, reply, 4, timeoutMs)) return "proxy: no SOCKS5 reply to the request";
+    if (reply[0] != 5) return "proxy: not a SOCKS5 proxy";
+    if (reply[1] != 0) {
+        return "proxy refused CONNECT: " + std::string(socks5_reply_text(reply[1]))
+             + " (SOCKS5 reply " + std::to_string(reply[1]) + ")";
+    }
+
+    // The bound address and port: nothing to use, but they are on the stream
+    // ahead of the tunnel and have to be read off it.
+    std::size_t bound = 0;
+    if (reply[3] == 1) {
+        bound = 4;
+    } else if (reply[3] == 4) {
+        bound = 16;
+    } else if (reply[3] == 3) {
+        unsigned char len;
+        if (!read_exact(sock, &len, 1, timeoutMs)) return "proxy: SOCKS5 reply was cut short";
+        bound = len;
+    } else {
+        return "proxy: SOCKS5 reply has an unknown address type";
+    }
+    unsigned char rest[258];
+    if (!read_exact(sock, rest, bound + 2, timeoutMs)) return "proxy: SOCKS5 reply was cut short";
+    return {};
+}
+
 // A connection to the target through a proxy. `error` is empty exactly when the
 // tunnel is open; otherwise it says what the proxy did, in words fit for a
 // caller to log.
@@ -236,12 +355,14 @@ export ProxyTunnel proxy_tunnel(const ProxyConfig& proxy,
     ProxyTunnel tunnel;
     const std::string where = proxy.host + ":" + std::to_string(proxy.port);
 
-    if (proxy.scheme == "http") {
+    if (proxy.scheme == "http" || proxy.scheme == "socks5" || proxy.scheme == "socks5h") {
         if (!tunnel.socket.connect(proxy.host.c_str(), proxy.port, timeoutMs)) {
             tunnel.error = "proxy: could not connect to " + where;
             return tunnel;
         }
-        tunnel.error = http_connect(tunnel.socket, proxy, targetHost, targetPort, timeoutMs);
+        tunnel.error = proxy.scheme == "http"
+            ? http_connect(tunnel.socket, proxy, targetHost, targetPort, timeoutMs)
+            : socks5_connect(tunnel.socket, proxy, targetHost, targetPort, timeoutMs);
         if (!tunnel.error.empty()) tunnel.socket.close();
     } else if (proxy.scheme == "https") {
         auto tls = std::make_unique<TlsSocket>();

@@ -7,7 +7,7 @@ Minimal C++23 HTTP/HTTPS client library with SSE (Server-Sent Events) streaming 
 - HTTP/HTTPS client with connection pooling (keep-alive)
 - SSE (Server-Sent Events) streaming
 - Streaming downloads to a file, with progress and cancellation
-- Proxy support (HTTP CONNECT, over plain HTTP or TLS, with Basic authentication)
+- Proxy support (HTTP CONNECT over plain HTTP or TLS, with Basic authentication; SOCKS5)
 - C++23 modules
 
 ## Usage
@@ -67,17 +67,30 @@ Set `proxy` to a URL and every request is tunnelled through it with `CONNECT`:
 cfg.proxy = "http://user:pass@proxy.example:3128";
 ```
 
-The scheme is `http` (a bare `host:port` means the same) or `https`. An
-`https://` proxy is reached over TLS first, the `CONNECT` is sent inside that
+The scheme is `http` (a bare `host:port` means the same), `https`, `socks5` or
+`socks5h`.
+
+An `https://` proxy is reached over TLS first, the `CONNECT` is sent inside that
 session, and the connection to the target is a second TLS session inside the
-tunnel; the two connections are set up alike, `verifySsl` included. Credentials
-are read from the URL and sent as Basic `Proxy-Authorization`; percent-escape any character that is special in
-a URL (`p%40ss` for `p@ss`). The port defaults to 8080, or 443 for `https`.
+tunnel; the two connections are set up alike, `verifySsl` included.
+
+With `socks5` the target's name is resolved here and the proxy is given an
+address; with `socks5h` the proxy is given the name and resolves it itself,
+which is what to use when the proxy is the only thing that can see the target's
+DNS. An address literal is sent as an address either way. The client offers the
+SOCKS5 proxy no authentication, plus the username/password method when the URL
+has credentials. SOCKS4 is not supported.
+
+Credentials are read from the URL and sent as Basic `Proxy-Authorization` (or as
+the SOCKS5 username and password); percent-escape any character that is special
+in a URL (`p%40ss` for `p@ss`). The port defaults to 8080, 443 for `https`, and
+1080 for the SOCKS schemes.
 
 When the proxy refuses the tunnel, `statusCode` is 0 and `statusText` carries
 its answer: `proxy rejected the credentials: 407 Proxy Authentication Required`,
-`proxy refused CONNECT: 403 Forbidden`. Any other scheme (`socks4://`, say)
-fails the same way instead of being read as HTTP.
+`proxy refused CONNECT: 403 Forbidden`, `proxy refused CONNECT: connection
+refused (SOCKS5 reply 5)`. Any other scheme (`socks4://`, say) fails the same
+way instead of being read as HTTP.
 
 ## Project templates
 

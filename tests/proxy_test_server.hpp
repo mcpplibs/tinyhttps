@@ -53,6 +53,9 @@ public:
     // read a byte at a time so nothing past it is taken. Empty on a hang-up.
     std::string read_head();
 
+    // Exactly `n` bytes, or empty when the client hangs up first.
+    std::string read_exact(std::size_t n);
+
     // Whatever arrives first, up to 4 KiB. Empty on a hang-up.
     std::string read_some();
 
@@ -181,6 +184,21 @@ inline std::string Peer::read_head() {
         head.push_back(static_cast<char>(c));
     }
     return head;
+}
+
+inline std::string Peer::read_exact(std::size_t n) {
+    std::string out;
+    unsigned char c {};
+    while (out.size() < n) {
+        bool ready = false;
+        for (int waited = 0; waited < 20000 && !ready; waited += 50) {
+            if (server_.stopping()) return {};
+            ready = wait_readable(50);
+        }
+        if (!ready || mbedtls_net_recv(&net_, &c, 1) <= 0) return {};
+        out.push_back(static_cast<char>(c));
+    }
+    return out;
 }
 
 inline std::string Peer::read_some() {

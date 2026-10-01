@@ -20,11 +20,8 @@ HTTP. And every refusal, whatever the proxy said, reached the caller as
   407 Proxy Authentication Required` when credentials were sent,
   `proxy requires credentials: ...` when none were, `proxy refused CONNECT: ...`
   for any other status. Any 2xx answer opens the tunnel; before, only 200 did.
-* A scheme other than `http` is an error (`proxy: unsupported scheme
-  'socks4'`) where it used to be read as HTTP. That also ends a habit that
-  happened to work: a proxy that answers HTTP and SOCKS on one port could be
-  used by writing `socks5://` or `https://` in front of it, because the scheme
-  was ignored.
+* A scheme this library does not speak is an error (`proxy: unsupported scheme
+  'socks4'`) where it used to be read as HTTP.
 * New `proxy_tunnel` returns the tunnel together with the reason it could not
   be made. `proxy_connect` keeps its signature and calls it, so it also accepts
   any 2xx answer now.
@@ -35,6 +32,13 @@ HTTP. And every refusal, whatever the proxy said, reached the caller as
   descriptor, because the bytes may already be decrypted there. The proxy
   connection is set up like the one to the target, `verifySsl` included. The
   default port for `https` is 443.
+* SOCKS5 proxies: `socks5://` resolves the target's name here and sends the
+  proxy an address, `socks5h://` sends the name. An address literal is sent as
+  an address in both. The client offers no authentication, plus the
+  username/password method when the URL has credentials. Failures are reported
+  in `statusText` the same way as for an HTTP proxy. The default port is 1080.
+  SOCKS4 is not supported and, like any unknown scheme, is an error.
+* `Socket::resolve_address` returns the address a name resolves to as raw bytes.
 
 ## 0.3.2
 

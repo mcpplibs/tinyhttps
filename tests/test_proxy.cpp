@@ -461,3 +461,234 @@ TEST_F(ProxyTest, AnHttpUrlToATlsProxyIsAnErrorAndNotAHang) {
     EXPECT_EQ(resp.statusCode, 0);
     EXPECT_FALSE(resp.statusText.empty());
 }
+
+// ── SOCKS5 ───────────────────────────────────────────────────────────────────
+
+namespace {
+
+// What a SOCKS5 proxy needs to know about how to behave.
+struct Socks5Script {
+    int targetPort { 0 };
+    // Empty: accept the no-authentication method. Otherwise "user:password",
+    // and the proxy insists on the username/password method.
+    std::string credentials;
+    // The reply code to the CONNECT request; 0 is success.
+    unsigned char replyCode { 0 };
+    // The address type of the bound address in a success reply: 1, 3 or 4.
+    unsigned char boundType { 1 };
+};
+
+std::string hex_of(std::string_view bytes) {
+    std::string out;
+    for (unsigned char c : bytes) out += std::format("{:02x}", c);
+    return out;
+}
+
+// Notes, in order: "methods:<hex>", "auth:<user>:<password>" when it was used,
+// and "request:<atyp>:<address>:<port>".
+proxy_test::Server::Handler socks5_handler(Socks5Script script) {
+    return [script](proxy_test::Peer& peer) {
+        auto greet = peer.read_exact(2);
+        if (greet.size() != 2 || greet[0] != 5) return;
+        auto methods = peer.read_exact(static_cast<unsigned char>(greet[1]));
+        peer.note("methods:" + hex_of(methods));
+
+        if (script.credentials.empty()) {
+            peer.write(std::string_view("\x05\x00", 2));
+        } else {
+            if (methods.find('\x02') == std::string::npos) {
+                peer.write(std::string_view("\x05\xff", 2));
+                return;
+            }
+            peer.write(std::string_view("\x05\x02", 2));
+            auto ver = peer.read_exact(2);                   // 0x01, ULEN
+            if (ver.size() != 2) return;
+            auto user = peer.read_exact(static_cast<unsigned char>(ver[1]));
+            auto plen = peer.read_exact(1);
+            if (plen.size() != 1) return;
+            auto pass = peer.read_exact(static_cast<unsigned char>(plen[0]));
+            peer.note("auth:" + user + ":" + pass);
+            if (user + ":" + pass != script.credentials) {
+                peer.write(std::string_view("\x01\x01", 2));
+                return;
+            }
+            peer.write(std::string_view("\x01\x00", 2));
+        }
+
+        auto head = peer.read_exact(4);                      // VER CMD RSV ATYP
+        if (head.size() != 4) return;
+        std::string addr;
+        std::size_t len = head[3] == 1 ? 4 : head[3] == 4 ? 16 : 0;
+        if (head[3] == 3) {
+            auto n = peer.read_exact(1);
+            if (n.size() != 1) return;
+            addr = peer.read_exact(static_cast<unsigned char>(n[0]));
+        } else {
+            addr = peer.read_exact(len);
+        }
+        auto port = peer.read_exact(2);
+        if (port.size() != 2) return;
+        peer.note(std::format("request:{}:{}:{}", static_cast<int>(head[3]),
+                              head[3] == 3 ? addr : hex_of(addr),
+                              (static_cast<unsigned char>(port[0]) << 8)
+                                  | static_cast<unsigned char>(port[1])));
+
+        std::string reply("\x05\x00\x00", 3);
+        reply[1] = static_cast<char>(script.replyCode);
+        reply += static_cast<char>(script.boundType);
+        if (script.boundType == 1)      reply.append(4, '\x7f');
+        else if (script.boundType == 4) reply.append(16, '\x01');
+        else                            reply += std::string("\x0c") + "bind.example";
+        reply.append("\x04\xd2", 2);
+        peer.write(reply);
+        if (script.replyCode == 0) peer.relay_to(script.targetPort);
+    };
+}
+
+std::string socks_url(std::string_view scheme, const proxy_test::Server& proxy,
+                      std::string_view userinfo = {}) {
+    std::string url(scheme);
+    url += "://";
+    if (!userinfo.empty()) { url += userinfo; url += "@"; }
+    return url + "127.0.0.1:" + std::to_string(proxy.port());
+}
+
+} // namespace
+
+TEST(ProxyUrl, SocksSchemesAreKeptAndDefaultToPort1080) {
+    auto a = https::parse_proxy_url("socks5://proxy.example");
+    EXPECT_EQ(a.scheme, "socks5");
+    EXPECT_EQ(a.port, 1080);
+    auto b = https::parse_proxy_url("SOCKS5H://u:p@proxy.example:9050");
+    EXPECT_EQ(b.scheme, "socks5h");
+    EXPECT_EQ(b.port, 9050);
+    EXPECT_EQ(b.user, "u");
+}
+
+TEST_F(ProxyTest, Socks5ConnectsToAnAddressLiteral) {
+    auto target = hello_server();
+    proxy_test::Server proxy(socks5_handler({ .targetPort = target.port() }));
+
+    https::HttpClient client(proxied(socks_url("socks5", proxy)));
+    auto resp = client.send(get(target.url("/")));
+
+    EXPECT_EQ(resp.statusCode, 200);
+    EXPECT_EQ(resp.body, "hello");
+    auto notes = proxy.notes();
+    ASSERT_EQ(notes.size(), 2u);
+    EXPECT_EQ(notes[0], "methods:00");   // no credentials, so only "none" is offered
+    EXPECT_EQ(notes[1], "request:1:7f000001:" + std::to_string(target.port()));
+}
+
+TEST_F(ProxyTest, Socks5hSendsAHostNameAndSocks5SendsAnAddress) {
+    auto target = hello_server();
+    const std::string url = "https://localhost:" + std::to_string(target.port()) + "/";
+
+    proxy_test::Server remote(socks5_handler({ .targetPort = target.port() }));
+    https::HttpClient viaH(proxied(socks_url("socks5h", remote)));
+    EXPECT_EQ(viaH.send(get(url)).statusCode, 200);
+    ASSERT_EQ(remote.notes().size(), 2u);
+    EXPECT_EQ(remote.notes()[1], "request:3:localhost:" + std::to_string(target.port()));
+
+    proxy_test::Server local(socks5_handler({ .targetPort = target.port() }));
+    https::HttpClient viaLocal(proxied(socks_url("socks5", local)));
+    EXPECT_EQ(viaLocal.send(get(url)).statusCode, 200);
+    ASSERT_EQ(local.notes().size(), 2u);
+    EXPECT_NE(local.notes()[1].substr(0, 10), "request:3:");   // an address, not the name
+}
+
+TEST_F(ProxyTest, Socks5UsernameAndPasswordAreOfferedAndSent) {
+    auto target = hello_server();
+    proxy_test::Server proxy(socks5_handler({ .targetPort = target.port(),
+                                              .credentials = "al@ice:p:ss w" }));
+
+    https::HttpClient client(proxied(socks_url("socks5h", proxy, "al%40ice:p%3Ass%20w")));
+    EXPECT_EQ(client.send(get(target.url("/"))).statusCode, 200);
+
+    auto notes = proxy.notes();
+    ASSERT_GE(notes.size(), 2u);
+    EXPECT_EQ(notes[0], "methods:0002");
+    EXPECT_EQ(notes[1], "auth:al@ice:p:ss w");
+}
+
+TEST_F(ProxyTest, Socks5WrongCredentialsAreReportedAsThat) {
+    auto target = hello_server();
+    proxy_test::Server proxy(socks5_handler({ .targetPort = target.port(),
+                                              .credentials = "alice:s3cret" }));
+
+    https::HttpClient client(proxied(socks_url("socks5", proxy, "alice:wrong")));
+    auto resp = client.send(get(target.url("/")));
+
+    EXPECT_EQ(resp.statusCode, 0);
+    EXPECT_NE(resp.statusText.find("rejected the credentials"), std::string::npos);
+    EXPECT_EQ(target.accepts(), 0);
+}
+
+TEST_F(ProxyTest, Socks5ProxyThatWantsCredentialsWeDidNotGiveSaysSo) {
+    auto target = hello_server();
+    proxy_test::Server proxy(socks5_handler({ .targetPort = target.port(),
+                                              .credentials = "alice:s3cret" }));
+
+    https::HttpClient client(proxied(socks_url("socks5", proxy)));
+    auto resp = client.send(get(target.url("/")));
+
+    EXPECT_EQ(resp.statusCode, 0);
+    EXPECT_NE(resp.statusText.find("requires credentials"), std::string::npos);
+}
+
+TEST_F(ProxyTest, Socks5RefusalCarriesTheReplyCode) {
+    proxy_test::Server proxy(socks5_handler({ .replyCode = 5 }));
+
+    https::HttpClient client(proxied(socks_url("socks5", proxy)));
+    auto resp = client.send(get("https://127.0.0.1:9/"));
+
+    EXPECT_EQ(resp.statusCode, 0);
+    EXPECT_NE(resp.statusText.find("refused CONNECT: connection refused (SOCKS5 reply 5)"),
+              std::string::npos);
+}
+
+TEST_F(ProxyTest, Socks5AnyBoundAddressTypeIsReadOffTheStream) {
+    // The reply to a successful CONNECT carries an address of one of three
+    // shapes. Misreading its length leaves bytes ahead of the TLS handshake
+    // and the request fails; reading it right is what a 200 here shows.
+    for (unsigned char type : {1, 3, 4}) {
+        auto target = hello_server();
+        proxy_test::Server proxy(socks5_handler({ .targetPort = target.port(), .boundType = type }));
+        https::HttpClient client(proxied(socks_url("socks5", proxy)));
+        EXPECT_EQ(client.send(get(target.url("/"))).statusCode, 200);
+    }
+}
+
+TEST_F(ProxyTest, Socks5ASpeakerOfAnotherProtocolIsNotMistakenForOne) {
+    proxy_test::Server proxy([](proxy_test::Peer& peer) {
+        peer.read_exact(3);
+        peer.write("HTTP/1.1 400 Bad Request\r\n\r\n");
+    });
+
+    https::HttpClient client(proxied(socks_url("socks5", proxy)));
+    auto resp = client.send(get("https://127.0.0.1:9/"));
+
+    EXPECT_EQ(resp.statusCode, 0);
+    EXPECT_NE(resp.statusText.find("not a SOCKS5 proxy"), std::string::npos);
+}
+
+TEST_F(ProxyTest, Socks5hRefusesAHostNameThatDoesNotFitTheRequest) {
+    proxy_test::Server proxy(socks5_handler({}));
+    https::HttpClient client(proxied(socks_url("socks5h", proxy)));
+    auto resp = client.send(get("https://" + std::string(300, 'a') + ".example/"));
+
+    EXPECT_EQ(resp.statusCode, 0);
+    EXPECT_NE(resp.statusText.find("does not fit a SOCKS5 request"), std::string::npos);
+}
+
+TEST_F(ProxyTest, TwoRequestsShareOneSocks5Tunnel) {
+    auto target = hello_server();
+    proxy_test::Server proxy(socks5_handler({ .targetPort = target.port() }));
+
+    https::HttpClient client(proxied(socks_url("socks5h", proxy)));
+    EXPECT_EQ(client.send(get(target.url("/a"))).statusCode, 200);
+    EXPECT_EQ(client.send(get(target.url("/b"))).statusCode, 200);
+
+    EXPECT_EQ(proxy.accepts(), 1);
+    EXPECT_EQ(target.accepts(), 1);
+}
