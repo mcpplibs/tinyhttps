@@ -3,16 +3,12 @@
 // Every wait here is far longer than the test should take (readTimeoutMs is
 // 30 s), so a request that returns promptly with `cancelled` set can only have
 // been ended by the token, never by a timeout.
-// `import std` comes first on purpose. With libc++ 22, a translation unit that
-// includes <atomic> or <thread> before importing std and then calls
-// stop_source::request_stop() fails to link (undefined
-// __atomic_unique_lock::__set_locked_bit). The other order links.
-import std;
-
 #include <gtest/gtest.h>
+#include "proxy_test_server.hpp"
 #include "tls_test_server.hpp"
 
 import mcpplibs.tinyhttps;
+import std;
 
 namespace https = mcpplibs::tinyhttps;
 
@@ -51,14 +47,23 @@ public:
     explicit Stopper(std::chrono::milliseconds delay,
                      std::function<bool()> ready = {})
         : thread_([this, delay, ready = std::move(ready)] {
-              for (int i = 0; ready && !ready() && i < 1000; ++i) {
+              for (int i = 0; ready && !ready() && i < 1000 && !quit_.load(); ++i) {
                   std::this_thread::sleep_for(std::chrono::milliseconds(5));
               }
-              std::this_thread::sleep_for(delay);
+              for (auto end = Clock::now() + delay;
+                   Clock::now() < end && !quit_.load();) {
+                  std::this_thread::sleep_for(std::chrono::milliseconds(5));
+              }
+              if (quit_.load()) return;
               stoppedAt_.store(Clock::now().time_since_epoch().count());
               source.request_stop();
           }) {}
-    ~Stopper() { if (thread_.joinable()) thread_.join(); }
+    // A stop that has not come yet is abandoned, so a long delay costs nothing
+    // when the call it was meant to end has already returned.
+    ~Stopper() {
+        quit_ = true;
+        if (thread_.joinable()) thread_.join();
+    }
 
     long long since_stop_ms(Clock::time_point returned) {
         thread_.join();
@@ -69,6 +74,7 @@ public:
 
 private:
     std::atomic<Clock::rep> stoppedAt_ { 0 };
+    std::atomic<bool> quit_ { false };
     std::thread thread_;
 };
 
@@ -145,8 +151,8 @@ private:
     std::thread thread_;
 };
 
-// Waits up to `limit` for `flag`, which is how a test learns that the server saw
-// the connection end.
+// Waits up to `limit` for `predicate`, which is how a test learns that the server
+// saw the connection end.
 bool becomes_true(const std::function<bool()>& predicate,
                   std::chrono::milliseconds limit = std::chrono::seconds(2)) {
     const auto deadline = Clock::now() + limit;
@@ -201,23 +207,12 @@ TEST_F(CancelTest, AStreamWaitingForTheNextChunkIsAbandoned) {
 
     https::HttpClient client(test_config());
     std::atomic<int> events { 0 };
-    std::stop_source source;
-    std::atomic<Clock::rep> stoppedAt { 0 };
-    std::thread stopper([&] {
-        for (int i = 0; i < 1000 && events.load() == 0; ++i) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(5));
-        }
-        std::this_thread::sleep_for(std::chrono::milliseconds(100));
-        stoppedAt = Clock::now().time_since_epoch().count();
-        source.request_stop();
-    });
+    Stopper stopper(std::chrono::milliseconds(100), [&] { return events.load() > 0; });
 
     auto res = client.send_stream(get(server.url("/")),
                                   [&](const https::SseEvent&) { ++events; return true; },
-                                  source.get_token());
-    const auto returned = Clock::now();
-    stopper.join();
-    const auto latency = ms_between(Clock::time_point(Clock::duration(stoppedAt.load())), returned);
+                                  stopper.source.get_token());
+    const auto latency = stopper.since_stop_ms(Clock::now());
     std::cout << "[ latency  ] stream: " << latency << " ms after the stop" << std::endl;
 
     EXPECT_EQ(res.statusCode, 200);
@@ -285,7 +280,8 @@ TEST_F(CancelTest, ATokenAlreadyStoppedSendsNothing) {
 }
 
 // The slices must not shorten or lengthen the timeout a token-carrying call
-// already had.
+// already had. The token is stopped after 5 s, so a timeout that never comes
+// fails the test rather than hanging the suite.
 TEST_F(CancelTest, ATokenThatIsNeverStoppedLeavesTheTimeoutAlone) {
     tls_test::Server server([](tls_test::Conn& conn, int) {
         conn.park();
@@ -294,10 +290,10 @@ TEST_F(CancelTest, ATokenThatIsNeverStoppedLeavesTheTimeoutAlone) {
     ASSERT_FALSE(server.failed());
 
     https::HttpClient client(test_config(/*readTimeoutMs=*/300));
-    std::stop_source source;
+    Stopper backstop(std::chrono::seconds(5));
 
     const auto started = Clock::now();
-    auto res = client.send(get(server.url("/")), source.get_token());
+    auto res = client.send(get(server.url("/")), backstop.source.get_token());
     const auto elapsed = ms_between(started, Clock::now());
 
     EXPECT_FALSE(res.cancelled);
@@ -401,4 +397,126 @@ TEST_F(CancelTest, CancelledRequestsDoNotLeakDescriptors) {
     const int before = open_fds();
     cancel_stuck_requests(20);
     EXPECT_EQ(open_fds(), before);
+}
+
+// A redirect whose body is still arriving when the stop comes has to be reported
+// as it is, not followed: the next request would be one the caller abandoned.
+TEST_F(CancelTest, ARedirectIsNotFollowedOnceTheRequestIsCancelled) {
+    tls_test::Server server([](tls_test::Conn& conn, int) {
+        conn.write("HTTP/1.1 302 Found\r\nLocation: /next\r\nContent-Length: 100\r\n\r\npartial");
+        conn.park();
+        return false;
+    });
+    ASSERT_FALSE(server.failed());
+
+    https::HttpClient client(test_config());
+    Stopper stopper(std::chrono::milliseconds(100), [&] { return server.requests() >= 1; });
+    auto res = client.send(get(server.url("/")), stopper.source.get_token());
+
+    EXPECT_TRUE(res.cancelled);
+    EXPECT_EQ(res.statusCode, 302);
+    EXPECT_EQ(res.bodyError, "cancelled");
+    EXPECT_EQ(server.requests(), 1);
+}
+
+// Connecting is a wait too, and nothing may be sent to an address once the stop
+// has been asked for. The listener only has to exist: the kernel completes the
+// connection for it, so an attempt shows as an accept.
+TEST_F(CancelTest, AConnectAfterTheStopSendsNoSyn) {
+    tls_test::Server server([](tls_test::Conn&, int) { return false; });
+    ASSERT_FALSE(server.failed());
+
+    std::stop_source source;
+    source.request_stop();
+    https::Socket sock;
+    sock.set_stop(source.get_token());
+
+    EXPECT_FALSE(sock.connect("127.0.0.1", server.port(), 4000));
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    EXPECT_EQ(server.accepts(), 0);
+}
+
+// ── through a proxy ──────────────────────────────────────────────────────────
+
+namespace {
+
+https::HttpClientConfig proxied_config(const std::string& proxyUrl) {
+    auto cfg = test_config();
+    cfg.proxy = proxyUrl;
+    return cfg;
+}
+
+// Holds a connection for up to 5 s or until `done`, so a test whose cancellation
+// fails sees the connection dropped (and an assertion fail) rather than a hang.
+void hold(const std::atomic<bool>& done) {
+    for (int i = 0; i < 500 && !done.load(); ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+}
+
+} // namespace
+
+TEST_F(CancelTest, AProxyThatNeverAnswersConnectIsAbandoned) {
+    std::atomic<bool> sawConnect { false };
+    std::atomic<bool> done { false };
+    proxy_test::Server proxy([&](proxy_test::Peer& peer) {
+        peer.read_head();
+        sawConnect = true;
+        hold(done);
+    });
+    ASSERT_FALSE(proxy.failed());
+
+    https::HttpClient client(proxied_config("http://127.0.0.1:" + std::to_string(proxy.port())));
+    Stopper stopper(std::chrono::milliseconds(100), [&] { return sawConnect.load(); });
+    auto res = client.send(get("https://127.0.0.1:9/"), stopper.source.get_token());
+    const auto returned = Clock::now();
+    done = true;
+
+    EXPECT_TRUE(res.cancelled);
+    EXPECT_EQ(res.statusCode, 0);
+    EXPECT_EQ(res.statusText, "Cancelled");
+    EXPECT_LT(stopper.since_stop_ms(returned), kPromptMs);
+}
+
+TEST_F(CancelTest, AnHttpsProxyThatNeverCompletesItsHandshakeIsAbandoned) {
+    std::atomic<bool> sawHello { false };
+    std::atomic<bool> done { false };
+    proxy_test::Server proxy([&](proxy_test::Peer& peer) {
+        peer.read_some();
+        sawHello = true;
+        hold(done);
+    });
+    ASSERT_FALSE(proxy.failed());
+
+    https::HttpClient client(proxied_config("https://127.0.0.1:" + std::to_string(proxy.port())));
+    Stopper stopper(std::chrono::milliseconds(100), [&] { return sawHello.load(); });
+    auto res = client.send(get("https://127.0.0.1:9/"), stopper.source.get_token());
+    const auto returned = Clock::now();
+    done = true;
+
+    EXPECT_TRUE(res.cancelled);
+    EXPECT_EQ(res.statusCode, 0);
+    EXPECT_LT(stopper.since_stop_ms(returned), kPromptMs);
+}
+
+// The session to the target runs inside the one to the proxy, and the stop has
+// to reach the proxy's session for the inner handshake to be interruptible.
+TEST_F(CancelTest, AHandshakeInsideAnHttpsProxyTunnelIsAbandoned) {
+    std::atomic<bool> tunnelOpen { false };
+    tls_test::Server proxy([&](tls_test::Conn& conn, int) {
+        conn.write("HTTP/1.1 200 Connection established\r\n\r\n");
+        tunnelOpen = true;
+        conn.wait_peer_close(std::chrono::seconds(5));
+        return false;
+    });
+    ASSERT_FALSE(proxy.failed());
+
+    https::HttpClient client(proxied_config("https://127.0.0.1:" + std::to_string(proxy.port())));
+    Stopper stopper(std::chrono::milliseconds(200), [&] { return tunnelOpen.load(); });
+    auto res = client.send(get("https://127.0.0.1:9/"), stopper.source.get_token());
+    const auto returned = Clock::now();
+
+    EXPECT_TRUE(res.cancelled);
+    EXPECT_EQ(res.statusCode, 0);
+    EXPECT_LT(stopper.since_stop_ms(returned), kPromptMs);
 }
