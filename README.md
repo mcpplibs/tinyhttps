@@ -52,7 +52,7 @@ means exactly what it did before.
 | --- | --- | --- |
 | `connectTimeoutMs` | 10000 | TCP connect |
 | `readTimeoutMs` | 60000 | any single read, and the total wait on a blocked write |
-| `verifySsl` | true | verify the server certificate |
+| `verifySsl` | true | verify the server certificate against the CA bundle (`SSL_CERT_FILE`, else the Windows `ROOT` certificate store in Windows Sockets builds, else a system location); the connection fails if the certificate is not trusted, has expired or is for another host, or if no bundle is found |
 | `keepAlive` | true | reuse connections between requests |
 | `maxRedirects` | 10 | 0 disables redirect following |
 | `maxResponseBodyBytes` | 64 MiB | the most `send()` will hold in memory; does not bound `download_to_file` or `send_stream` |
@@ -108,6 +108,17 @@ differs between them.
 ```bash
 cd examples/openkal && mcpp run
 ```
+
+Above openkal two things differ from a host build. Both follow from the layer
+beneath and not from this library:
+
+- On Windows the socket interface is the POSIX one, because the C library is
+  musl, so the Windows `ROOT` certificate store is not read. Set `SSL_CERT_FILE`
+  to a PEM bundle of trusted roots; without one every HTTPS connection is
+  refused, and `statusText` says so.
+- `connectTimeoutMs` does not bound the TCP connect. `kal_net_connect` has no
+  form that begins a connection and reports its outcome later, so the connect
+  completes or fails before it returns.
 
 ## 使用 mcpp 构建
 

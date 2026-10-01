@@ -1,5 +1,26 @@
 # Changelog
 
+## Unreleased
+
+`verifySsl = true` now verifies the server certificate. The handshake used to
+complete with any certificate (a self-signed one, one for another host, an
+expired one) because `MBEDTLS_SSL_VERIFY_OPTIONAL` was set and nothing read the
+result afterwards.
+
+* The handshake fails when the chain is not trusted, the certificate has expired
+  or its name is not the host being connected to. The reason is in `statusText`,
+  for example `certificate verification failed: The certificate validity has
+  expired`; other handshake failures carry the mbedTLS error text. A refused TCP
+  connection still reads `Connection failed`.
+* Behaviour change: with `verifySsl = true` and no CA bundle found
+  (`SSL_CERT_FILE` unset or unreadable, none of the system locations present),
+  the connection fails with a message saying so, where it used to go ahead
+  unverified. Point `SSL_CERT_FILE` at a PEM bundle, or set `verifySsl = false`.
+* On Windows, when `SSL_CERT_FILE` is not set, the roots in the system `ROOT`
+  certificate store that are usable for TLS servers are read. That code is built
+  only for Windows Sockets targets, not for the musl one. MinGW builds need
+  `-lcrypt32`, as they already need `-lws2_32`.
+
 ## 0.3.2
 
 `download_to_file` no longer reports success for a file the disk did not keep.
