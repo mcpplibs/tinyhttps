@@ -209,14 +209,27 @@ jobs:
           mcpp --version
           mcpp self config --mirror GLOBAL
 
-      - name: Install the runners
+      # Only what the target needs, and without recommends: wine64 with them is
+      # a desktop's worth of packages, and one run spent the job's whole budget
+      # in this step. The Windows headers are the ones openkal-windows builds
+      # against; the compilers are mcpp's.
+      - name: Install the runner
         if: matrix.target == 'x86_64-windows-musl' || matrix.target == 'aarch64-linux-musl'
+        timeout-minutes: 15
+        env:
+          DEBIAN_FRONTEND: noninteractive
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq mingw-w64 wine64 qemu-user > /dev/null
-          command -v wine || sudo ln -s "$(command -v wine64)" /usr/local/bin/wine
-          wine --version
-          qemu-aarch64 --version | head -1
+          case '${{ matrix.target }}' in
+            x86_64-windows-musl)
+              sudo apt-get install -y -qq --no-install-recommends mingw-w64-x86-64-dev wine64 > /dev/null
+              ls /usr/x86_64-w64-mingw32/include/windows.h
+              command -v wine || sudo ln -s "$(command -v wine64)" /usr/local/bin/wine
+              wine --version ;;
+            aarch64-linux-musl)
+              sudo apt-get install -y -qq --no-install-recommends qemu-user > /dev/null
+              qemu-aarch64 --version | head -1 ;;
+          esac
 
       - name: Cache mcpp sandbox
         uses: actions/cache@v4
