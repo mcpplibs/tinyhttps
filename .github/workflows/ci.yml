@@ -36,10 +36,22 @@ env:
   XLINGS_NON_INTERACTIVE: '1'
 
 jobs:
+  # ── Linux, under both standard libraries ─────────────────────────────────────
+  #
+  # WHY TWO TOOLCHAINS. The job used to run whatever mcpp installed by default on
+  # a fresh runner, which is gcc and libstdc++, and nothing ran the tests under
+  # libc++. libc++ is the standard library of every other job below — macOS and
+  # openkal — and of mcpp's own default where a developer has chosen llvm; the
+  # cancellation tests met a libc++ defect that libstdc++ does not have
+  # (tests/test_cancel.cpp, at the top), and no job here could have seen it.
   build:
-    name: build + test (linux x86_64, mcpp)
+    name: build + test (linux x86_64, ${{ matrix.toolchain }})
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        toolchain: ['gcc@16.1.0', 'llvm@22.1.8']
     steps:
       - uses: actions/checkout@v4
 
@@ -67,21 +79,28 @@ jobs:
           mcpp self config --mirror GLOBAL
 
       # The toolchain mcpp bootstraps is decided by the version pinned above, so
-      # that version is the whole of the key.
+      # that version and the toolchain are the whole of the key.
       - name: Cache mcpp sandbox
         uses: actions/cache@v4
         with:
           path: ~/.xlings/data/xpkgs/xim-x-mcpp/${{ env.MCPP_VERSION }}/registry
-          key: mcpp-sandbox-${{ runner.os }}-mcpp${{ env.MCPP_VERSION }}
+          key: mcpp-sandbox-${{ runner.os }}-mcpp${{ env.MCPP_VERSION }}-${{ matrix.toolchain }}
+
+      - name: Select the toolchain
+        run: |
+          spec='${{ matrix.toolchain }}'
+          mcpp toolchain install "${spec%@*}" "${spec#*@}"
+          mcpp toolchain default "$spec"
+          mcpp toolchain list
 
       - name: Build with mcpp
         run: mcpp build
 
-      # Most of these are hermetic: `test_framing` needs nothing, and `test_pool`
-      # scripts its own TLS server on 127.0.0.1. The eight in `test_download`
-      # and `test_resolver` reach httpbin.org and one.one.one.one; a network
-      # failure among them is distinguishable in the log by the endpoint it
-      # names.
+      # Most of these are hermetic: `test_framing` needs nothing, and `test_pool`,
+      # `test_proxy` and `test_cancel` script their own servers on 127.0.0.1. The
+      # eight in `test_download` and `test_resolver` reach httpbin.org and
+      # one.one.one.one; a network failure among them is distinguishable in the
+      # log by the endpoint it names.
       - name: Run tests
         run: mcpp test
 
@@ -95,23 +114,16 @@ jobs:
       - name: Smoke-test the project templates
         run: bash tools/template_smoke.sh
 
-  # ── The same sources, on a different kernel ABI ──────────────────────────────
+  # ── macOS ────────────────────────────────────────────────────────────────────
   #
-  # WHY THIS IS A SEPARATE JOB AND NOT A STEP. It resolves a different toolchain
-  # (llvm rather than gcc) and a different everything below the program — musl
-  # ported onto openkal, libc++ configured for that musl, and openkal-linux
-  # beneath both. Sharing a job would mean sharing a cache key between two
-  # stacks that have nothing in common but the source tree.
-  #
-  # WHAT IT CATCHES THAT THE JOB ABOVE CANNOT. `Socket::write` sends with
-  # MSG_NOSIGNAL and `connect_addrinfo` sets SO_NOSIGPIPE, and which of those
-  # exists is decided by the C library rather than by the operating system —
-  # openkal-musl defines the first and not the second. A `#ifdef` that is wrong
-  # about that compiles cleanly here and fails there, which is exactly how
-  # 5e7d66f reached master.
-  openkal:
-    name: build + run (linux x86_64, above openkal)
-    runs-on: ubuntu-latest
+  # THE README NAMES macOS, AND UNTIL THIS JOB NOTHING RAN THERE. The
+  # differences are real and in this library's own code: SO_NOSIGPIPE rather
+  # than MSG_NOSIGNAL (src/platform.cppm), /dev/urandom as mbedTLS's entropy,
+  # the system CA bundle's location, and poll(2) on a socket whose connect is in
+  # progress, which the cancellation slices wait on.
+  macos:
+    name: build + test (macos arm64, llvm@22.1.8)
+    runs-on: macos-15
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
@@ -134,28 +146,110 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.xlings/data/xpkgs/xim-x-mcpp/${{ env.MCPP_VERSION }}/registry
-          key: mcpp-openkal-${{ runner.os }}-mcpp${{ env.MCPP_VERSION }}
+          key: mcpp-sandbox-${{ runner.os }}-mcpp${{ env.MCPP_VERSION }}-llvm@22.1.8
+
+      - name: Select the toolchain
+        run: |
+          mcpp toolchain install llvm 22.1.8
+          mcpp toolchain default llvm@22.1.8
+          mcpp toolchain list
+
+      - name: Build with mcpp
+        run: mcpp build
+
+      - name: Run tests
+        run: mcpp test
+
+  # ── The same sources, on a different kernel ABI ──────────────────────────────
+  #
+  # WHY THIS IS A SEPARATE JOB AND NOT A STEP. It resolves a different toolchain
+  # (llvm rather than gcc) and a different everything below the program — musl
+  # ported onto openkal, libc++ configured for that musl, and openkal-linux
+  # beneath both. Sharing a job would mean sharing a cache key between two
+  # stacks that have nothing in common but the source tree.
+  #
+  # WHAT IT CATCHES THAT THE JOB ABOVE CANNOT. `Socket::write` sends with
+  # MSG_NOSIGNAL and `connect_addrinfo` sets SO_NOSIGPIPE, and which of those
+  # exists is decided by the C library rather than by the operating system —
+  # openkal-musl defines the first and not the second. A `#ifdef` that is wrong
+  # about that compiles cleanly here and fails there, which is exactly how
+  # 5e7d66f reached master.
+  #
+  # FOUR TARGETS, THE ONES mcpp-index MEASURES tinyhttps ON (its
+  # tests/openkal/pins.toml). x86_64-windows-musl runs under wine and
+  # aarch64-linux-musl under qemu, through the runners examples/openkal names.
+  # The Windows one is where every handshake used to fail for want of entropy
+  # (src/tls.cppm); it has no name resolution, so its network step reports
+  # "no network" and the cancellation check, which needs none, is what runs.
+  openkal:
+    name: build + run (${{ matrix.target }}, above openkal)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        target: ['x86_64-linux-gnu', 'x86_64-linux-musl', 'x86_64-windows-musl', 'aarch64-linux-musl']
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install xlings
+        run: |
+          curl -fsSL --retry 3 --retry-all-errors --retry-delay 2 \
+            https://raw.githubusercontent.com/openxlings/xlings/main/tools/other/quick_install.sh \
+            | bash -s "$XLINGS_VERSION"
+          echo "$HOME/.xlings/subos/current/bin" >> "$GITHUB_PATH"
+
+      - name: Install mcpp
+        run: |
+          xlings update
+          xlings install "mcpp@$MCPP_VERSION" -y -g
+          mcpp --version
+          mcpp self config --mirror GLOBAL
+
+      - name: Install the runners
+        if: matrix.target == 'x86_64-windows-musl' || matrix.target == 'aarch64-linux-musl'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq mingw-w64 wine64 qemu-user > /dev/null
+          command -v wine || sudo ln -s "$(command -v wine64)" /usr/local/bin/wine
+          wine --version
+          qemu-aarch64 --version | head -1
+
+      - name: Cache mcpp sandbox
+        uses: actions/cache@v4
+        with:
+          path: ~/.xlings/data/xpkgs/xim-x-mcpp/${{ env.MCPP_VERSION }}/registry
+          key: mcpp-openkal-${{ runner.os }}-mcpp${{ env.MCPP_VERSION }}-${{ matrix.target }}
 
       # The example builds the library from this checkout (`path = "../.."`) and
       # takes the stack beneath it from the index, so what is tested is this
       # commit against the published openkal packages.
       #
-      # It makes one HTTPS request and reports "no network" rather than failing
-      # when there is none, so a runner without egress reports "not run" instead
-      # of "broken". A certificate the client refused is a failure, not an
-      # absence of network. The build, the link and the framing parsers are
-      # checked either way.
+      # It cancels a handshake against a local listener, which needs no network,
+      # and then makes one HTTPS request; it reports "no network" rather than
+      # failing when there is none, so a runner without egress reports "not run"
+      # instead of "broken". A certificate the client refused is a failure, not
+      # an absence of network. The build, the link, the framing parsers and the
+      # cancellation are checked either way.
       - name: Build and run above openkal
         working-directory: examples/openkal
-        run: mcpp run
+        run: |
+          set -o pipefail
+          mcpp run --target '${{ matrix.target }}' 2>&1 | tee run.log
+          grep -q '^cancellation: ok' run.log
 
-  # ── The Windows ROOT certificate store ───────────────────────────────────────
+  # ── Windows ──────────────────────────────────────────────────────────────────
   #
   # WHY THIS JOB EXISTS. Windows keeps no bundle file, so on a Windows Sockets
   # build `load_ca_certs` reads the system's ROOT store through the Win32 API
   # (src/ca_bundle.cppm). That code is compiled on no other platform, and a job
   # elsewhere can show neither that it builds nor that the roots it returns
   # verify a real certificate chain. `test_ca_store` asserts both.
+  #
+  # AND THE HERMETIC TESTS RUN HERE TOO. They script their own servers on
+  # 127.0.0.1, and Windows Sockets is where `poll` is `WSAPoll`, a connect in
+  # progress is reported differently, and the cancellation slices were never
+  # run before this job ran them.
   windows:
     name: build + test (windows x86_64, ${{ matrix.toolchain }})
     runs-on: windows-2022
@@ -197,3 +291,11 @@ jobs:
         run: |
           mcpp test test_ca_store 2>&1 | tee tests.log
           grep -q '^test_ca_store \.\.\. ok' tests.log
+
+      - name: The hermetic tests
+        run: |
+          set -o pipefail
+          for t in test_framing test_tls_verify test_pool test_proxy test_cancel; do
+            mcpp test "$t" 2>&1 | tee "$t.log"
+            grep -q "^$t \.\.\. ok" "$t.log"
+          done
