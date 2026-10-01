@@ -46,7 +46,7 @@ T0 计划（本文）+ 设计文档纳入 PR
  │     d. libc++ 下 import std 的位置（M2）
  │
  ├─ T6 openkal：examples/openkal 增加不联网的取消检查（本地监听 + 握手中取消）
- │     运行时版本跟 mcpp-index 的 pins.toml 对齐；增加 windows-musl（wine）
+ │     运行时版本跟 mcpp-index 的 pins.toml 对齐；增加 windows-musl（Linux 上构建，windows-2022 上原生运行；本地用 wine）
  │
  ├─ T7 CI（依赖 T5d、T6）
  │     linux {gcc@16.1.0, llvm@22.1.8} 跑全部测试 · macos-15 llvm@22.1.8 跑全部测试
@@ -81,7 +81,7 @@ T0 计划（本文）+ 设计文档纳入 PR
 | linux | gcc@16.1.0 / llvm@22.1.8 | 全部 `mcpp test`（`test_download`、`test_resolver` 需联网）+ 模板冒烟 |
 | macos-15 | llvm@22.1.8 | 全部 `mcpp test` |
 | windows-2022 | msvc / llvm@20.1.7 | `test_ca_store`，以及不联网的 `test_framing`、`test_pool`、`test_proxy`、`test_cancel`、`test_tls_verify` |
-| openkal | llvm@22.1.8 + openkal-llvm-runtime | `examples/openkal` 在 x86_64-linux-gnu 上原生跑、在 x86_64-windows-musl 上通过 wine 跑 |
+| openkal | llvm@22.1.8 + openkal-llvm-runtime | `examples/openkal` 在 x86_64-linux-gnu 上原生跑、x86_64-windows-musl 在 Linux 上构建、在 windows-2022 上原生跑（CI 装 wine 要 4–30 多分钟，且不稳定）|
 
 某个平台上测试编不过时，**修测试，不删平台**。确实做不到的，单独开 issue 记下原因，并在 job 里写清楚。
 

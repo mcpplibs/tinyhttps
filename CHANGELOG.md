@@ -51,7 +51,7 @@ as their last argument ([#23](https://github.com/mcpplibs/tinyhttps/pull/23)).
 * `examples/openkal` follows mcpp-index's openkal measurement: runtime 0.15.2,
   and a cancellation check against a local listener that needs no network. CI
   runs it on x86_64-linux-gnu, x86_64-linux-musl, aarch64-linux-musl (qemu) and
-  x86_64-windows-musl (wine).
+  x86_64-windows-musl, which is built on Linux and run on Windows itself.
 
 ### CI
 
