@@ -8,7 +8,8 @@
 //
 // Run it with `mcpp run` from this directory. It needs the network; when there
 // is none it says so and exits 0, because a CI job without egress should report
-// "not run" rather than "broken".
+// "not run" rather than "broken". A certificate the client refused is not an
+// absence of network, and exits 1.
 import mcpplibs.tinyhttps;
 import std;
 
@@ -40,6 +41,21 @@ int main() {
 
     auto response = client.send(request);
     if (response.statusCode == 0) {
+        // A certificate the client refused is a verdict about this stack, not
+        // an absence of network, and is reported as one. Read as "no network",
+        // a CA bundle this stack cannot find would pass here unnoticed.
+        constexpr std::string_view refusals[] = {
+            "certificate verification failed",
+            "no CA certificate bundle",
+            "cannot parse the CA certificate bundle",
+            "TLS handshake failed",
+        };
+        for (auto refusal : refusals) {
+            if (response.statusText.starts_with(refusal)) {
+                std::println("TLS refused: {}", response.statusText);
+                return 1;
+            }
+        }
         std::println("no network ({}) — the build and the parsers are still verified",
                      response.statusText);
         return 0;

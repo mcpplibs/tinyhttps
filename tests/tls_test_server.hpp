@@ -110,6 +110,51 @@ VQKaSq3Gef7/KLR3YARmm5A=
 -----END PRIVATE KEY-----
 )PEM";
 
+// Two more self-signed certificates, each wrong in one way, for the tests that
+// check the client refuses them (test_tls_verify.cpp). Same terms as above:
+// public keys, no secrets.
+//
+// kExpiredCertPem is CN/SAN localhost and 127.0.0.1, valid 2020-01-01 to 2020-01-02.
+inline constexpr const char* kExpiredCertPem = R"PEM(-----BEGIN CERTIFICATE-----
+MIIBeDCCAR6gAwIBAgIUQR4qNY0KJQYcYEO7585+Fy5Q/U8wCgYIKoZIzj0EAwIw
+FDESMBAGA1UEAwwJbG9jYWxob3N0MB4XDTIwMDEwMTAwMDAwMFoXDTIwMDEwMjAw
+MDAwMFowFDESMBAGA1UEAwwJbG9jYWxob3N0MFkwEwYHKoZIzj0CAQYIKoZIzj0D
+AQcDQgAEEb2pNZ4XE7aYNPdWF5+/h+6Ug+KoqKMnRQDgr4OfRvZPIH9NROFnEXnK
+stqlISOxthgAmIkR1W3pLSj2BooVT6NOMEwwGgYDVR0RBBMwEYIJbG9jYWxob3N0
+hwR/AAABMA8GA1UdEwEB/wQFMAMBAf8wHQYDVR0OBBYEFNSI5hk66wZ6dXb/N5+v
+6H3CXr5+MAoGCCqGSM49BAMCA0gAMEUCIQD48yY+f7UE0URCJghr3Q+58od8BkxG
+zvn+vOvdRjKNZwIgdfrfRWxHrQS/mfyZyzQwTWHHa/TXLD5Z+vlFNjSuAIk=
+-----END CERTIFICATE-----
+)PEM";
+
+inline constexpr const char* kExpiredKeyPem = R"PEM(-----BEGIN PRIVATE KEY-----
+MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgP8T1y7ZRNYINaXf1
++ciH6e0/avbCUNliO/brgmagw/OhRANCAAQRvak1nhcTtpg091YXn7+H7pSD4qio
+oydFAOCvg59G9k8gf01E4WcRecqy2qUhI7G2GACYiRHVbektKPYGihVP
+-----END PRIVATE KEY-----
+)PEM";
+
+// kWrongNameCertPem is valid for a century but names only wrong.example.
+inline constexpr const char* kWrongNameCertPem = R"PEM(-----BEGIN CERTIFICATE-----
+MIIBgTCCASagAwIBAgIUUaQJz12pEvdBKiHf8zQ3agib668wCgYIKoZIzj0EAwIw
+GDEWMBQGA1UEAwwNd3JvbmcuZXhhbXBsZTAgFw0yNjEwMDEwMzU5NTZaGA8yMTI2
+MDkwNzAzNTk1NlowGDEWMBQGA1UEAwwNd3JvbmcuZXhhbXBsZTBZMBMGByqGSM49
+AgEGCCqGSM49AwEHA0IABAIy/jbI/tnfJmp4lDT9WtuvNNu3CapWaAAsXrXPBYVg
+R5MyHwQhLGq9Uy+ZC9dpJI6R1+9b5NUCh5RfaOE4zYOjTDBKMBgGA1UdEQQRMA+C
+DXdyb25nLmV4YW1wbGUwDwYDVR0TAQH/BAUwAwEB/zAdBgNVHQ4EFgQUFN3zbGMq
+Zu37qSve4CdZ6qXXSsAwCgYIKoZIzj0EAwIDSQAwRgIhAO/UR5PxHU2spE47HbQf
+4qPyonqIlmGB1kp129etm0dYAiEAsjTvx61zqcTrES7R+zQOYykJ67PVTqqGkxIP
+uv23Y9g=
+-----END CERTIFICATE-----
+)PEM";
+
+inline constexpr const char* kWrongNameKeyPem = R"PEM(-----BEGIN PRIVATE KEY-----
+MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgdB0xMbmMhgDdvjON
+ESmHq2CHTvE0SbWMP8P4Kt/GWpqhRANCAAQCMv42yP7Z3yZqeJQ0/VrbrzTbtwmq
+VmgALF61zwWFYEeTMh8EISxqvVMvmQvXaSSOkdfvW+TVAoeUX2jhOM2D
+-----END PRIVATE KEY-----
+)PEM";
+
 class Server;
 
 // One accepted connection, after its handshake. Handed to the test's handler.
@@ -247,7 +292,10 @@ public:
     // Return true to serve another request on the same connection.
     using Handler = std::function<bool(Conn&, int index)>;
 
-    explicit Server(Handler handler) : handler_(std::move(handler)) {
+    // Serves `certPem`/`keyPem`, the default pair unless a test needs another.
+    explicit Server(Handler handler, const char* certPem = kCertPem,
+                    const char* keyPem = kKeyPem)
+        : handler_(std::move(handler)), certPem_(certPem), keyPem_(keyPem) {
         mbedtls_net_init(&listener_);
         // Port 0: the OS picks a free one, which is what lets tests run
         // concurrently and on a machine where anything might already be bound.
@@ -348,11 +396,11 @@ private:
 
         if (mbedtls_ctr_drbg_seed(&drbg, mbedtls_entropy_func, &entropy, nullptr, 0) != 0
             || mbedtls_x509_crt_parse(&cert,
-                   reinterpret_cast<const unsigned char*>(kCertPem),
-                   std::strlen(kCertPem) + 1) != 0
+                   reinterpret_cast<const unsigned char*>(certPem_),
+                   std::strlen(certPem_) + 1) != 0
             || mbedtls_pk_parse_key(&key,
-                   reinterpret_cast<const unsigned char*>(kKeyPem),
-                   std::strlen(kKeyPem) + 1, nullptr, 0,
+                   reinterpret_cast<const unsigned char*>(keyPem_),
+                   std::strlen(keyPem_) + 1, nullptr, 0,
                    mbedtls_ctr_drbg_random, &drbg) != 0
             || mbedtls_ssl_config_defaults(&conf, MBEDTLS_SSL_IS_SERVER,
                    MBEDTLS_SSL_TRANSPORT_STREAM, MBEDTLS_SSL_PRESET_DEFAULT) != 0) {
@@ -392,6 +440,8 @@ private:
     }
 
     Handler handler_;
+    const char* certPem_;
+    const char* keyPem_;
     mbedtls_net_context listener_ {};
     int port_ { 0 };
     bool failed_ { false };

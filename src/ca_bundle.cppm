@@ -2,9 +2,28 @@ module;
 
 #include <cstdio>
 
+// The same switch as socket.cppm. The store is read through the Win32 API, whose
+// headers a build on the POSIX socket interface does not have.
+#if defined(_WIN32) && !defined(TINYHTTPS_POSIX_SOCKETS)
+#define TINYHTTPS_WINSOCK 1
+#endif
+
+#ifdef TINYHTTPS_WINSOCK
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#include <wincrypt.h>
+#pragma comment(lib, "crypt32.lib")
+#endif
+
 export module mcpplibs.tinyhttps:ca_bundle;
 
 import std;
+import :platform;
 
 namespace mcpplibs::tinyhttps {
 
@@ -24,6 +43,59 @@ auto read_file(const char* path) -> std::string {
     return result;
 }
 
+#ifdef TINYHTTPS_WINSOCK
+// Whether the root may be used to authenticate a server: no usage restriction at
+// all, or serverAuth listed. Windows marks roots it no longer trusts for TLS
+// servers through this restriction, and the store still holds them.
+auto trusted_for_servers(const CERT_CONTEXT* c) -> bool {
+    DWORD n = 0;
+    if (!::CertGetEnhancedKeyUsage(c, 0, nullptr, &n)) {
+        return false;
+    }
+    std::vector<std::byte> buf(n);
+    auto* usage = reinterpret_cast<CERT_ENHKEY_USAGE*>(buf.data());
+    if (!::CertGetEnhancedKeyUsage(c, 0, usage, &n)) {
+        return false;
+    }
+    if (usage->cUsageIdentifier == 0) {
+        // CRYPT_E_NOT_FOUND means no restriction; otherwise the root allows no use.
+        return ::GetLastError() == CRYPT_E_NOT_FOUND;
+    }
+    for (DWORD i = 0; i < usage->cUsageIdentifier; ++i) {
+        if (std::strcmp(usage->rgpszUsageIdentifier[i], szOID_PKIX_KP_SERVER_AUTH) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+#endif
+
+// The Windows ROOT store as one PEM string; empty elsewhere or on failure.
+auto system_store_pem() -> std::string {
+    std::string pem;
+#ifdef TINYHTTPS_WINSOCK
+    if (HCERTSTORE store = ::CertOpenSystemStoreW(0, L"ROOT")) {
+        for (const CERT_CONTEXT* c = nullptr; (c = ::CertEnumCertificatesInStore(store, c));) {
+            if (!trusted_for_servers(c)) {
+                continue;
+            }
+            DWORD n = 0;
+            if (!::CryptBinaryToStringA(c->pbCertEncoded, c->cbCertEncoded,
+                                        CRYPT_STRING_BASE64HEADER, nullptr, &n)) {
+                continue;
+            }
+            std::string one(n, '\0');
+            if (::CryptBinaryToStringA(c->pbCertEncoded, c->cbCertEncoded,
+                                       CRYPT_STRING_BASE64HEADER, one.data(), &n)) {
+                pem.append(one, 0, n);
+            }
+        }
+        ::CertCloseStore(store, 0);
+    }
+#endif
+    return pem;
+}
+
 } // anonymous namespace
 
 export auto load_ca_certs() -> std::string {
@@ -33,6 +105,13 @@ export auto load_ca_certs() -> std::string {
     if (const char* env = std::getenv("SSL_CERT_FILE"); env && *env) {
         auto pem = read_file(env);
         if (!pem.empty()) {
+            return pem;
+        }
+    }
+
+    // Windows has no bundle file; read the system's trusted roots instead.
+    if constexpr (platform::uses_winsock) {
+        if (auto pem = system_store_pem(); !pem.empty()) {
             return pem;
         }
     }

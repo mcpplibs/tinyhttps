@@ -7,6 +7,14 @@ module;
 #include <mbedtls/error.h>
 #include <mbedtls/net_sockets.h>
 
+// mbedTLS draws its entropy from BCryptGenRandom on Windows. Its package asks
+// for the library as `-lbcrypt`, which link.exe does not read, so the request is
+// made here in the form every linker for this target reads, as socket.cppm does
+// for ws2_32.
+#if defined(_WIN32) && !defined(TINYHTTPS_POSIX_SOCKETS)
+#pragma comment(lib, "bcrypt.lib")
+#endif
+
 export module mcpplibs.tinyhttps:tls;
 
 import :socket;
@@ -78,6 +86,21 @@ static int bio_recv(void* ctx, unsigned char* buf, size_t len) {
     return ret;   // 0 means end of stream; mbedtls turns it into SSL_CONN_EOF
 }
 
+static std::string mbedtls_message(int ret) {
+    char buf[200];
+    mbedtls_strerror(ret, buf, sizeof buf);
+    return buf;
+}
+
+// verify_info ends every reason with a newline; join them with "; ".
+static std::string one_line(std::string text) {
+    while (!text.empty() && text.back() == '\n') text.pop_back();
+    for (std::size_t pos = 0; (pos = text.find('\n', pos)) != std::string::npos;) {
+        text.replace(pos, 1, "; ");
+    }
+    return text;
+}
+
 // WHAT A READ ENDED IN, WHICH `int` COULD NOT SAY.
 //
 // `TlsSocket::read` returned 0 for a peer that had closed AND for a transport
@@ -109,7 +132,8 @@ public:
     TlsSocket(TlsSocket&& other) noexcept
         : socket_(std::move(other.socket_))
         , lower_(std::move(other.lower_))
-        , state_(std::move(other.state_)) {
+        , state_(std::move(other.state_))
+        , error_(std::move(other.error_)) {
         // Re-bind BIO to point to our socket_ (not the moved-from one)
         bind_bio();
     }
@@ -121,6 +145,7 @@ public:
             socket_ = std::move(other.socket_);
             lower_ = std::move(other.lower_);
             state_ = std::move(other.state_);
+            error_ = std::move(other.error_);
             // Re-bind BIO to point to our socket_
             bind_bio();
         }
@@ -131,9 +156,14 @@ public:
         return state_ != nullptr && (lower_ ? lower_->is_valid() : socket_.is_valid());
     }
 
+    // Why the last connect_over/connect failed once the TCP connection was up;
+    // empty if it failed earlier or has not failed.
+    [[nodiscard]] const std::string& error() const { return error_; }
+
     // Connect over an already-established Socket (e.g. a proxy tunnel).
     // Takes ownership of the socket and performs TLS handshake on top of it.
     bool connect_over(Socket&& socket, const char* host, bool verifySsl) {
+        error_.clear();
         socket_ = std::move(socket);
         return setup_tls(host, verifySsl);
     }
@@ -148,6 +178,7 @@ public:
     }
 
     bool connect(const char* host, int port, int timeoutMs, bool verifySsl) {
+        error_.clear();
         // Step 1: TCP connect via Socket
         if (!socket_.connect(host, port, timeoutMs)) {
             return false;
@@ -244,6 +275,14 @@ private:
     // `state_` points at it.
     std::unique_ptr<TlsSocket> lower_;
     std::unique_ptr<TlsState> state_;
+    std::string error_;
+
+    bool fail(std::string message) {
+        error_ = std::move(message);
+        state_.reset();
+        socket_.close();
+        return false;
+    }
 
     // The BIO of a session that runs inside another is that session, which stays
     // put when this object moves; the BIO of one on a socket is `socket_`, which
@@ -289,22 +328,14 @@ private:
         int ret = mbedtls_ctr_drbg_seed(
             &state_->ctr_drbg, mbedtls_entropy_func, &state_->entropy,
             nullptr, 0);
-        if (ret != 0) {
-            state_.reset();
-            drop_transport();
-            return false;
-        }
+        if (ret != 0) return fail(mbedtls_message(ret));
 
         ret = mbedtls_ssl_config_defaults(
             &state_->conf,
             MBEDTLS_SSL_IS_CLIENT,
             MBEDTLS_SSL_TRANSPORT_STREAM,
             MBEDTLS_SSL_PRESET_DEFAULT);
-        if (ret != 0) {
-            state_.reset();
-            drop_transport();
-            return false;
-        }
+        if (ret != 0) return fail(mbedtls_message(ret));
 
         mbedtls_ssl_conf_rng(&state_->conf, mbedtls_ctr_drbg_random, &state_->ctr_drbg);
 
@@ -314,6 +345,10 @@ private:
 
         // Load CA certs
         auto ca_pem = load_ca_certs();
+        if (ca_pem.empty() && verifySsl) {
+            return fail("no CA certificate bundle found; set SSL_CERT_FILE to a PEM "
+                        "file of trusted roots, or set verifySsl to false");
+        }
         if (!ca_pem.empty()) {
             ret = mbedtls_x509_crt_parse(
                 &state_->ca_cert,
@@ -321,37 +356,22 @@ private:
                 ca_pem.size() + 1); // +1 for null terminator required by mbedtls
             // ret > 0 means some certs failed to parse but others succeeded — acceptable
             if (ret < 0) {
-                state_.reset();
-                drop_transport();
-                return false;
+                return fail("cannot parse the CA certificate bundle: " + mbedtls_message(ret));
             }
             mbedtls_ssl_conf_ca_chain(&state_->conf, &state_->ca_cert, nullptr);
         }
 
-        // Certificate verification
-        // Use OPTIONAL (not REQUIRED) so handshake succeeds even if the CA
-        // bundle is incomplete; callers that need strict verification can
-        // inspect the verification result after handshake.
-        if (verifySsl) {
-            mbedtls_ssl_conf_authmode(&state_->conf, MBEDTLS_SSL_VERIFY_OPTIONAL);
-        } else {
-            mbedtls_ssl_conf_authmode(&state_->conf, MBEDTLS_SSL_VERIFY_NONE);
-        }
+        // Certificate verification. REQUIRED makes the handshake fail on a bad
+        // chain, an expired certificate or a name that is not `host`.
+        mbedtls_ssl_conf_authmode(&state_->conf,
+            verifySsl ? MBEDTLS_SSL_VERIFY_REQUIRED : MBEDTLS_SSL_VERIFY_NONE);
 
         ret = mbedtls_ssl_setup(&state_->ssl, &state_->conf);
-        if (ret != 0) {
-            state_.reset();
-            drop_transport();
-            return false;
-        }
+        if (ret != 0) return fail(mbedtls_message(ret));
 
         // Set hostname for SNI
         ret = mbedtls_ssl_set_hostname(&state_->ssl, host);
-        if (ret != 0) {
-            state_.reset();
-            drop_transport();
-            return false;
-        }
+        if (ret != 0) return fail(mbedtls_message(ret));
 
         // Set BIO callbacks using our Socket, or the session beneath this one
         bind_bio();
@@ -359,9 +379,13 @@ private:
         // Perform TLS handshake
         while ((ret = mbedtls_ssl_handshake(&state_->ssl)) != 0) {
             if (ret != MBEDTLS_ERR_SSL_WANT_READ && ret != MBEDTLS_ERR_SSL_WANT_WRITE) {
-                state_.reset();
-                drop_transport();
-                return false;
+                if (ret == MBEDTLS_ERR_X509_CERT_VERIFY_FAILED) {
+                    char info[512] = {};
+                    mbedtls_x509_crt_verify_info(info, sizeof info, "",
+                        mbedtls_ssl_get_verify_result(&state_->ssl));
+                    return fail("certificate verification failed: " + one_line(info));
+                }
+                return fail("TLS handshake failed: " + mbedtls_message(ret));
             }
         }
 

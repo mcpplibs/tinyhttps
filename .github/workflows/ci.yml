@@ -142,8 +142,58 @@ jobs:
       #
       # It makes one HTTPS request and reports "no network" rather than failing
       # when there is none, so a runner without egress reports "not run" instead
-      # of "broken". The build, the link and the framing parsers are checked
-      # either way.
+      # of "broken". A certificate the client refused is a failure, not an
+      # absence of network. The build, the link and the framing parsers are
+      # checked either way.
       - name: Build and run above openkal
         working-directory: examples/openkal
         run: mcpp run
+
+  # ── The Windows ROOT certificate store ───────────────────────────────────────
+  #
+  # WHY THIS JOB EXISTS. Windows keeps no bundle file, so on a Windows Sockets
+  # build `load_ca_certs` reads the system's ROOT store through the Win32 API
+  # (src/ca_bundle.cppm). That code is compiled on no other platform, and a job
+  # elsewhere can show neither that it builds nor that the roots it returns
+  # verify a real certificate chain. `test_ca_store` asserts both.
+  windows:
+    name: build + test (windows x86_64, ${{ matrix.toolchain }})
+    runs-on: windows-2022
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        toolchain: ['msvc@system', 'llvm@20.1.7']
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install xlings
+        shell: pwsh
+        run: |
+          irm https://d2learn.org/xlings-install.ps1.txt | iex
+          "$env:USERPROFILE\.xlings\subos\current\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+      - name: Install mcpp
+        run: |
+          xlings update
+          xlings install "mcpp@$MCPP_VERSION" -y -g
+          mcpp --version
+          mcpp self config --mirror GLOBAL
+
+      - name: Select the toolchain
+        run: |
+          spec='${{ matrix.toolchain }}'
+          case "$spec" in
+            msvc*) mcpp toolchain default msvc ;;
+            *)     mcpp toolchain install "${spec%@*}" "${spec#*@}"
+                   mcpp toolchain default "$spec" ;;
+          esac
+          mcpp toolchain list
+
+      - name: The system store verifies a public chain
+        run: |
+          mcpp test test_ca_store 2>&1 | tee tests.log
+          grep -q '^test_ca_store \.\.\. ok' tests.log

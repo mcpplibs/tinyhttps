@@ -1043,8 +1043,13 @@ private:
                 sock = &inserted->second;
                 std::string openError;
                 if (!open_connection(*sock, parsed, openError)) {
+                    // The proxy's refusal, else the TLS session's reason,
+                    // else the TCP connection failed and there is no more to say.
+                    std::string why = std::move(openError);
+                    if (why.empty()) why = sock->error();
+                    if (why.empty()) why = "Connection failed";
                     guard.drop();
-                    return { nullptr, {}, openError.empty() ? "Connection failed" : openError };
+                    return { nullptr, {}, std::move(why) };
                 }
             }
 
