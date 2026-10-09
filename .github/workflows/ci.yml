@@ -288,10 +288,26 @@ jobs:
       # "Platforms"), so the program is given a bundle: Git for Windows's, copied
       # beside it, because openkal resolves a relative name against the working
       # directory and names no absolute path.
+      #
+      # Git is asked where its bundle is, and the install searched after that,
+      # rather than the directory named: the runner image that brought Git for
+      # Windows 2.56 has no `mingw64/etc/ssl/certs/ca-bundle.crt`, and the job
+      # failed there before the program ran.
       - name: Run above openkal
         run: |
           set -o pipefail
-          cp "/c/Program Files/Git/mingw64/etc/ssl/certs/ca-bundle.crt" ca-bundle.crt
+          git --version
+          ca=$(git config --system --get http.sslcainfo || true)
+          if [ -n "$ca" ]; then ca=$(cygpath -u "$ca"); fi
+          if [ ! -f "$ca" ]; then
+            ca=$(find "/c/Program Files/Git" -path '*/ssl/certs/ca-bundle.crt' -print -quit)
+          fi
+          if [ ! -f "$ca" ]; then
+            echo "::error::no CA bundle in the Git for Windows install"
+            exit 1
+          fi
+          echo "CA bundle: $ca"
+          cp "$ca" ca-bundle.crt
           SSL_CERT_FILE=ca-bundle.crt ./smoke.exe 2>&1 | tee run.log
           grep -q '^cancellation: ok' run.log
 
@@ -352,7 +368,7 @@ jobs:
       - name: The hermetic tests
         run: |
           set -o pipefail
-          for t in test_framing test_tls_verify test_pool test_proxy test_cancel test_extra_ca; do
+          for t in test_framing test_tls_verify test_pool test_proxy test_cancel test_handshake_timeout test_extra_ca; do
             mcpp test "$t" 2>&1 | tee "$t.log"
             grep -q "^$t \.\.\. ok" "$t.log"
           done

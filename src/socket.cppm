@@ -52,7 +52,8 @@ public:
 
     // Move constructor
     Socket(Socket&& other) noexcept
-        : fd_(other.fd_), stop_(std::move(other.stop_)) {
+        : fd_(other.fd_), stop_(std::move(other.stop_)), deadline_(other.deadline_)
+        , deadline_hit_(other.deadline_hit_) {
         other.fd_ = INVALID_SOCKET_FD;
     }
 
@@ -62,6 +63,8 @@ public:
             close();
             fd_ = other.fd_;
             stop_ = std::move(other.stop_);
+            deadline_ = other.deadline_;
+            deadline_hit_ = other.deadline_hit_;
             other.fd_ = INVALID_SOCKET_FD;
         }
         return *this;
@@ -76,6 +79,42 @@ public:
     void set_stop(std::stop_token stop) { stop_ = std::move(stop); }
 
     [[nodiscard]] bool stop_possible() const { return stop_.stop_possible(); }
+
+    // Bounds the TLS handshake: until it is cleared, `wait_before_recv` gives up
+    // once this time has passed. Cleared once the handshake is over.
+    void set_deadline(std::optional<std::chrono::steady_clock::time_point> deadline) {
+        deadline_ = deadline;
+        deadline_hit_ = false;
+    }
+
+    // True once `wait_before_recv` gave up because of the deadline.
+    [[nodiscard]] bool deadline_hit() const { return deadline_hit_; }
+
+    // What `bio_recv` calls ahead of a `recv` that would otherwise block. True
+    // when a `recv` now will not block. With neither a token nor a deadline it
+    // answers true without waiting, so the plain `recv` is as it was.
+    //
+    // A wait that ends before the deadline is waited again for what is left: a
+    // signal ends `poll` with EINTR even under SA_RESTART, which the blocking
+    // `recv` this wait stands in front of would have restarted. The deadline is
+    // hit only when the clock says so.
+    bool wait_before_recv() {
+        if (!stop_.stop_possible() && !deadline_) return true;
+        for (;;) {
+            int wait = -1;
+            if (deadline_) {
+                const auto left = std::chrono::ceil<std::chrono::milliseconds>(
+                    *deadline_ - std::chrono::steady_clock::now()).count();
+                wait = left > 0 ? static_cast<int>(left) : 0;
+            }
+            if (wait_readable(wait)) return true;
+            if (stop_.stop_requested() || !deadline_) return false;
+            if (std::chrono::steady_clock::now() >= *deadline_) {
+                deadline_hit_ = true;
+                return false;
+            }
+        }
+    }
 
     bool connect(const char* host, int port, int timeoutMs) {
         // Close existing connection if any
@@ -342,6 +381,8 @@ public:
 private:
     SocketHandle fd_ = INVALID_SOCKET_FD;
     std::stop_token stop_;
+    std::optional<std::chrono::steady_clock::time_point> deadline_;
+    bool deadline_hit_ = false;
 
     // poll_fd in slices while a token is attached. A negative timeout waits
     // without limit. Not std::min: <winsock2.h> defines a `min` macro.
