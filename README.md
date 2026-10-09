@@ -214,14 +214,14 @@ Windows). Locally,
 ### 添加依赖
 
 ```bash
-mcpp add tinyhttps@0.3.4
+mcpp add tinyhttps@0.3.5
 ```
 
 或在 `mcpp.toml` 中手动添加：
 
 ```toml
 [dependencies]
-tinyhttps = "0.3.4"
+tinyhttps = "0.3.5"
 ```
 
 ### 构建

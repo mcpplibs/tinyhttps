@@ -1,10 +1,18 @@
 # Changelog
 
-## Unreleased
+## 0.3.5
+
+A handshake that never completes no longer holds a request for good, and a
+private CA can be trusted alongside the default store. It is a patch release, so
+a dependency written as a caret range, `tinyhttps = "^0.3.1"`, resolves to it;
+the one change in behaviour, a handshake slower than `connectTimeoutMs` now
+failing, is the end of a hang rather than a new failure mode, and is described
+below.
 
 ### TLS handshake time limit
 
-The TLS handshake is bounded by `connectTimeoutMs`. It had no limit: after the
+[#25](https://github.com/mcpplibs/tinyhttps/pull/25). The TLS handshake is
+bounded by `connectTimeoutMs`. It had no limit: after the
 TCP connection was up, a server (or an https:// proxy) that accepted it and never
 sent its ServerHello held `send`, `send_stream` and `download_to_file` for good
 unless the caller passed a stop token.
@@ -27,7 +35,7 @@ unless the caller passed a stop token.
 
 ### Extra CA certificates
 
-`HttpClientConfig::extraCaFile` is a path to a PEM file whose certificates are
+[#24](https://github.com/mcpplibs/tinyhttps/pull/24). `HttpClientConfig::extraCaFile` is a path to a PEM file whose certificates are
 trusted in addition to the default store, which `SSL_CERT_FILE` can only replace.
 It is for a private CA or a proxy that re-signs TLS.
 
@@ -37,6 +45,13 @@ It is for a private CA or a proxy that re-signs TLS.
   `statusText` names the file.
 * `proxy_tunnel` takes the path as a trailing default argument, and `TlsSocket`
   gains `set_extra_ca_file`. Nothing changes while the field is empty.
+
+### CI
+
+* The openkal job on Windows asks Git for Windows where its CA bundle is; 2.56
+  moved it from `mingw64/` to `ucrt64/`, and the job failed before it ran.
+* The Windows job runs `test_handshake_timeout` and `test_extra_ca` with the
+  other hermetic tests.
 
 ## 0.3.4
 
