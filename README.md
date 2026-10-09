@@ -79,7 +79,7 @@ includes in that file, or use libc++ 23 or libstdc++.
 
 | field | default | what it decides |
 | --- | --- | --- |
-| `connectTimeoutMs` | 10000 | TCP connect |
+| `connectTimeoutMs` | 10000 | setting up the connection: the TCP connect, each wait for a proxy's reply, and the TLS handshake, with the proxy and with the target (the handshake as a whole, not each read in it) |
 | `readTimeoutMs` | 60000 | any single read, and the total wait on a blocked write |
 | `verifySsl` | true | verify the server certificate against the CA bundle (`SSL_CERT_FILE`, else the Windows `ROOT` certificate store in Windows Sockets builds, else a system location); the connection fails if the certificate is not trusted, has expired or is for another host, or if no bundle is found |
 | `keepAlive` | true | reuse connections between requests |

@@ -1,5 +1,26 @@
 # Changelog
 
+## Unreleased
+
+The TLS handshake is bounded by `connectTimeoutMs`. It had no limit: after the
+TCP connection was up, a server (or an https:// proxy) that accepted it and never
+sent its ServerHello held `send`, `send_stream` and `download_to_file` for good
+unless the caller passed a stop token.
+
+* The handshake gives up once `connectTimeoutMs` has passed since it began, and
+  `statusText` is `TLS handshake timed out`. This covers the handshake with the
+  target, with an https:// proxy, and with the target inside an https:// proxy's
+  tunnel. The limit is on the handshake as a whole, so a peer that sends a byte
+  at a time does not hold it open.
+* Behaviour change: a handshake slower than `connectTimeoutMs` (10 s by default)
+  now fails where it used to complete. Each step of setting up a connection (the
+  TCP connect, a proxy's reply, a handshake) has `connectTimeoutMs` to itself, so
+  the whole can take several times that.
+* `TlsSocket::connect_over` takes a trailing `handshakeTimeoutMs`, `-1` (the
+  default) for no limit; a call by name compiles unchanged, a pointer to it needs
+  the new parameter in its type. `Socket` gains `set_deadline`, `deadline_hit`
+  and `wait_before_recv`.
+
 ## 0.3.4
 
 A request in flight can be abandoned from another thread. Everything is added

@@ -94,8 +94,9 @@ static int bio_send(void* ctx, const unsigned char* buf, size_t len) {
 // complete and correct.
 static int bio_recv(void* ctx, unsigned char* buf, size_t len) {
     auto* sock = static_cast<Socket*>(ctx);
-    // With a stop token, wait here so the recv below cannot block past a stop.
-    if (sock->stop_possible() && !sock->wait_readable(-1)) {
+    // With a stop token or a handshake deadline, wait here so the recv below
+    // cannot block past a stop or the deadline.
+    if (!sock->wait_before_recv()) {
         return MBEDTLS_ERR_NET_RECV_FAILED;
     }
     int ret = sock->read(reinterpret_cast<char*>(buf), static_cast<int>(len));
@@ -208,20 +209,24 @@ public:
 
     // Connect over an already-established Socket (e.g. a proxy tunnel).
     // Takes ownership of the socket and performs TLS handshake on top of it.
-    bool connect_over(Socket&& socket, const char* host, bool verifySsl) {
+    // The handshake gives up after `handshakeTimeoutMs`; a negative value waits
+    // without limit.
+    bool connect_over(Socket&& socket, const char* host, bool verifySsl,
+                      int handshakeTimeoutMs = -1) {
         error_.clear();
         socket_ = std::move(socket);
-        return setup_tls(host, verifySsl);
+        return setup_tls(host, verifySsl, handshakeTimeoutMs);
     }
 
     // Run the handshake inside another TLS session, which is how a client
     // reaches a target through an https:// proxy: TLS to the proxy, CONNECT
     // inside it, then this session to the target inside the tunnel. Takes
     // ownership of `lower`, which must already be past its CONNECT.
-    bool connect_over(std::unique_ptr<TlsSocket> lower, const char* host, bool verifySsl) {
+    bool connect_over(std::unique_ptr<TlsSocket> lower, const char* host, bool verifySsl,
+                      int handshakeTimeoutMs = -1) {
         error_.clear();
         lower_ = std::move(lower);
-        return setup_tls(host, verifySsl);
+        return setup_tls(host, verifySsl, handshakeTimeoutMs);
     }
 
     bool connect(const char* host, int port, int timeoutMs, bool verifySsl) {
@@ -231,7 +236,7 @@ public:
             return false;
         }
 
-        return setup_tls(host, verifySsl);
+        return setup_tls(host, verifySsl, timeoutMs);
     }
 
     // The read that says which of the four things happened. Prefer it over
@@ -371,7 +376,16 @@ private:
         socket_.close();
     }
 
-    bool setup_tls(const char* host, bool verifySsl) {
+    // As `set_stop`, the deadline belongs to the socket at the bottom, which
+    // inside a tunnel is the one beneath `lower_`.
+    void set_deadline(std::optional<std::chrono::steady_clock::time_point> deadline) {
+        if (lower_) lower_->set_deadline(deadline);
+        else socket_.set_deadline(deadline);
+    }
+
+    bool deadline_hit() const { return lower_ ? lower_->deadline_hit() : socket_.deadline_hit(); }
+
+    bool setup_tls(const char* host, bool verifySsl, int handshakeTimeoutMs) {
         state_ = std::make_unique<TlsState>();
 
         int ret = mbedtls_ctr_drbg_seed(
@@ -429,17 +443,30 @@ private:
         // Set BIO callbacks using our Socket, or the session beneath this one
         bind_bio();
 
-        // Perform TLS handshake
-        while ((ret = mbedtls_ssl_handshake(&state_->ssl)) != 0) {
-            if (ret != MBEDTLS_ERR_SSL_WANT_READ && ret != MBEDTLS_ERR_SSL_WANT_WRITE) {
-                if (ret == MBEDTLS_ERR_X509_CERT_VERIFY_FAILED) {
-                    char info[512] = {};
-                    mbedtls_x509_crt_verify_info(info, sizeof info, "",
-                        mbedtls_ssl_get_verify_result(&state_->ssl));
-                    return fail("certificate verification failed: " + one_line(info));
-                }
-                return fail("TLS handshake failed: " + mbedtls_message(ret));
+        // Perform TLS handshake. The socket is blocking, so `bio_recv` waits
+        // against the deadline before it reads, and the deadline is taken off
+        // again before the connection is used.
+        std::optional<std::chrono::steady_clock::time_point> deadline;
+        if (handshakeTimeoutMs >= 0) {
+            deadline = std::chrono::steady_clock::now()
+                     + std::chrono::milliseconds(handshakeTimeoutMs);
+        }
+        set_deadline(deadline);
+        while ((ret = mbedtls_ssl_handshake(&state_->ssl)) == MBEDTLS_ERR_SSL_WANT_READ
+               || ret == MBEDTLS_ERR_SSL_WANT_WRITE) {}
+        const bool timedOut = deadline_hit();
+        set_deadline({});
+        if (ret != 0) {
+            if (ret == MBEDTLS_ERR_X509_CERT_VERIFY_FAILED) {
+                char info[512] = {};
+                mbedtls_x509_crt_verify_info(info, sizeof info, "",
+                    mbedtls_ssl_get_verify_result(&state_->ssl));
+                return fail("certificate verification failed: " + one_line(info));
             }
+            if (ret == MBEDTLS_ERR_NET_RECV_FAILED && timedOut) {
+                return fail("TLS handshake timed out");
+            }
+            return fail("TLS handshake failed: " + mbedtls_message(ret));
         }
 
         return true;
