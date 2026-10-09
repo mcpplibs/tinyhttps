@@ -1,5 +1,20 @@
 # Changelog
 
+## Unreleased
+
+### Extra CA certificates
+
+`HttpClientConfig::extraCaFile` is a path to a PEM file whose certificates are
+trusted in addition to the default store, which `SSL_CERT_FILE` can only replace.
+It is for a private CA or a proxy that re-signs TLS.
+
+* It applies wherever a trust store is built: the target, and the connection to
+  an `https://` proxy.
+* A file that cannot be read or holds no certificate fails the connection, and
+  `statusText` names the file.
+* `proxy_tunnel` takes the path as a trailing default argument, and `TlsSocket`
+  gains `set_extra_ca_file`. Nothing changes while the field is empty.
+
 ## 0.3.4
 
 A request in flight can be abandoned from another thread. Everything is added

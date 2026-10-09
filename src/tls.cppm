@@ -165,7 +165,8 @@ public:
         : socket_(std::move(other.socket_))
         , lower_(std::move(other.lower_))
         , state_(std::move(other.state_))
-        , error_(std::move(other.error_)) {
+        , error_(std::move(other.error_))
+        , extraCaFile_(std::move(other.extraCaFile_)) {
         // Re-bind BIO to point to our socket_ (not the moved-from one)
         bind_bio();
     }
@@ -178,6 +179,7 @@ public:
             lower_ = std::move(other.lower_);
             state_ = std::move(other.state_);
             error_ = std::move(other.error_);
+            extraCaFile_ = std::move(other.extraCaFile_);
             // Re-bind BIO to point to our socket_
             bind_bio();
         }
@@ -205,6 +207,10 @@ public:
         if (lower_) lower_->set_stop(stop);
         socket_.set_stop(std::move(stop));
     }
+
+    // A PEM file of roots to trust in addition to the default store. Call before
+    // connect(); setup fails if the file cannot be read or holds no certificate.
+    void set_extra_ca_file(std::string path) { extraCaFile_ = std::move(path); }
 
     // Connect over an already-established Socket (e.g. a proxy tunnel).
     // Takes ownership of the socket and performs TLS handshake on top of it.
@@ -323,6 +329,7 @@ private:
     std::unique_ptr<TlsSocket> lower_;
     std::unique_ptr<TlsState> state_;
     std::string error_;
+    std::string extraCaFile_;
 
     // The session beneath this one, when there is one, is closed as well: a
     // failed handshake to the target leaves nothing of the tunnel open.
@@ -411,6 +418,24 @@ private:
             if (ret < 0) {
                 return fail("cannot parse the CA certificate bundle: " + mbedtls_message(ret));
             }
+        }
+        // Roots the caller adds to the above. A file that cannot be used is an
+        // error, not something to skip: the caller named it because a server
+        // needs it, and skipping would surface later as a verification failure
+        // that does not mention the file.
+        if (!extraCaFile_.empty()) {
+            std::ifstream in(extraCaFile_, std::ios::binary);
+            if (!in) return fail("cannot read extra CA file '" + extraCaFile_ + "'");
+            std::string extra((std::istreambuf_iterator<char>(in)), {});
+            ret = mbedtls_x509_crt_parse(
+                &state_->ca_cert,
+                reinterpret_cast<const unsigned char*>(extra.c_str()), extra.size() + 1);
+            if (ret < 0) {
+                return fail("cannot parse extra CA file '" + extraCaFile_ + "': "
+                            + mbedtls_message(ret));
+            }
+        }
+        if (!ca_pem.empty() || !extraCaFile_.empty()) {
             mbedtls_ssl_conf_ca_chain(&state_->conf, &state_->ca_cert, nullptr);
         }
 
