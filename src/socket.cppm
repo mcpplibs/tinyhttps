@@ -52,7 +52,8 @@ public:
 
     // Move constructor
     Socket(Socket&& other) noexcept
-        : fd_(other.fd_), stop_(std::move(other.stop_)), deadline_(other.deadline_) {
+        : fd_(other.fd_), stop_(std::move(other.stop_)), deadline_(other.deadline_)
+        , deadline_hit_(other.deadline_hit_) {
         other.fd_ = INVALID_SOCKET_FD;
     }
 
@@ -63,6 +64,7 @@ public:
             fd_ = other.fd_;
             stop_ = std::move(other.stop_);
             deadline_ = other.deadline_;
+            deadline_hit_ = other.deadline_hit_;
             other.fd_ = INVALID_SOCKET_FD;
         }
         return *this;
@@ -91,17 +93,27 @@ public:
     // What `bio_recv` calls ahead of a `recv` that would otherwise block. True
     // when a `recv` now will not block. With neither a token nor a deadline it
     // answers true without waiting, so the plain `recv` is as it was.
+    //
+    // A wait that ends before the deadline is waited again for what is left: a
+    // signal ends `poll` with EINTR even under SA_RESTART, which the blocking
+    // `recv` this wait stands in front of would have restarted. The deadline is
+    // hit only when the clock says so.
     bool wait_before_recv() {
         if (!stop_.stop_possible() && !deadline_) return true;
-        int wait = -1;
-        if (deadline_) {
-            const auto left = std::chrono::ceil<std::chrono::milliseconds>(
-                *deadline_ - std::chrono::steady_clock::now()).count();
-            wait = left > 0 ? static_cast<int>(left) : 0;
+        for (;;) {
+            int wait = -1;
+            if (deadline_) {
+                const auto left = std::chrono::ceil<std::chrono::milliseconds>(
+                    *deadline_ - std::chrono::steady_clock::now()).count();
+                wait = left > 0 ? static_cast<int>(left) : 0;
+            }
+            if (wait_readable(wait)) return true;
+            if (stop_.stop_requested() || !deadline_) return false;
+            if (std::chrono::steady_clock::now() >= *deadline_) {
+                deadline_hit_ = true;
+                return false;
+            }
         }
-        if (wait_readable(wait)) return true;
-        if (deadline_ && !stop_.stop_requested()) deadline_hit_ = true;
-        return false;
     }
 
     bool connect(const char* host, int port, int timeoutMs) {

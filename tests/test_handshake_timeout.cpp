@@ -15,6 +15,10 @@ import std;
 #include <gtest/gtest.h>
 #include "proxy_test_server.hpp"
 #include "tls_test_server.hpp"
+#ifndef _WIN32
+#include <pthread.h>
+#include <signal.h>
+#endif
 
 import mcpplibs.tinyhttps;
 #ifndef _LIBCPP_VERSION
@@ -214,6 +218,50 @@ TEST_F(HandshakeTimeoutTest, ABytePerReadDoesNotHoldTheHandshakeOpen) {
     EXPECT_EQ(res.statusText, "TLS handshake timed out");
     EXPECT_LT(since_ms(start), kPromptMs);
 }
+
+// A signal whose handler was installed with SA_RESTART restarts a blocking
+// `recv`, so it never ended a handshake before the deadline existed. The wait
+// that the deadline puts ahead of each `recv` is a `poll`, which a signal ends
+// with EINTR whatever the flag; that has to be waited out, not taken for the
+// deadline. The signals go to this thread, the one in the handshake.
+#ifndef _WIN32
+namespace {
+void ignore_signal(int) {}
+}
+
+TEST_F(HandshakeTimeoutTest, ASignalDuringTheHandshakeIsNotATimeout) {
+    Silent peer;
+    ASSERT_FALSE(peer.failed());
+
+    struct sigaction action {}, previous {};
+    action.sa_handler = ignore_signal;
+    action.sa_flags = SA_RESTART;
+    sigemptyset(&action.sa_mask);
+    ASSERT_EQ(sigaction(SIGUSR1, &action, &previous), 0);
+
+    auto cfg = test_config();
+    cfg.connectTimeoutMs = 1000;
+    https::HttpClient client(cfg);
+    const pthread_t self = pthread_self();
+    std::atomic<bool> done { false };
+    std::thread signaller([&] {
+        for (int i = 0; i < 5 && !done.load(); ++i) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            if (!done.load()) pthread_kill(self, SIGUSR1);
+        }
+    });
+    const auto start = Clock::now();
+    auto res = client.send(get(peer.url()));
+    const auto took = since_ms(start);
+    done = true;
+    signaller.join();
+    sigaction(SIGUSR1, &previous, nullptr);
+
+    EXPECT_EQ(res.statusText, "TLS handshake timed out");
+    EXPECT_GE(took, 900) << "the handshake ended at a signal, not at the deadline";
+    EXPECT_LT(took, kPromptMs);
+}
+#endif
 
 // connectTimeoutMs is for establishing the connection. Once the handshake is
 // done a read waits as long as it always did: here 1600 ms of silence after a
