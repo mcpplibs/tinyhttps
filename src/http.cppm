@@ -1052,10 +1052,10 @@ private:
             }
             if (tunnel.proxyTls) {
                 return sock.connect_over(std::move(tunnel.proxyTls), parsed.host.c_str(),
-                                         config_.verifySsl);
+                                         config_.verifySsl, config_.connectTimeoutMs);
             }
             return sock.connect_over(std::move(tunnel.socket), parsed.host.c_str(),
-                                     config_.verifySsl);
+                                     config_.verifySsl, config_.connectTimeoutMs);
         }
         return sock.connect(parsed.host.c_str(), parsed.port,
                             config_.connectTimeoutMs, config_.verifySsl);
