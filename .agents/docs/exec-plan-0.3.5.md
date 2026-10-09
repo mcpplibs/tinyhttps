@@ -164,6 +164,8 @@ T0 计划（本文）← 你在这里审
 - [x] H1 能复现，修复后用例通过 🔁；已推送到 #25
 - [x] #25 CI 全绿（run 37968516327，10/10），包括 Windows openkal 和 Windows hermetic（`test_handshake_timeout`）
 - [x] #25 squash 合入（`9d4315e`）；#24 同步 master（合并时 CHANGELOG 和 Windows 测试列表都有冲突）后 CI 10/10 全绿，squash 合入（`a0f7749`）
-- [ ] 版本号按 D1 确定；tag、GitHub release
-- [ ] gitcode tarball 的 sha256 一致
-- [ ] mcpp-index 合入；`"^0.3.1"` 在两个源下都解析到 0.3.5
+- [x] 版本号 0.3.5（D1）；发版 commit `6153cdd` 的 master CI 10/10 全绿；tag `0.3.5`，GitHub release
+- [x] gitcode `mcpp-res/tinyhttps` 0.3.5 的 tarball 和 GitHub archive 的 sha256 一致（`6f75f9e6…58a3`）
+- [x] mcpp-index 合入（mcpplibs/mcpp-index#517，`bf7e87c`）：PR 的全部检查通过，包括 openkal measure 和 linux/macos/windows workspace；合入后 Publish Index Artifact、validate、deploy-site 也都通过
+- [x] 真实验证：用已发布的 index 新建项目，依赖写 `"^0.3.1"`，在 GLOBAL 和 CN 两个源下（都清了缓存）都解析到 0.3.5。真实 HTTPS 请求返回 200；握手不回应的本地对端在 `connectTimeoutMs=500` 下约 520 ms 报 `TLS handshake timed out`；`extraCaFile` 文件不存在时，报错里带路径；指向系统 bundle 时请求正常返回 200
+- 注：mcpp 在一个源失败时会自动换另一个源，所以“切到某个源跑通”证明不了用的是哪个源。两个 URL 内容一致，是直接下载后比对 sha256 得出的
