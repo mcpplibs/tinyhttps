@@ -86,7 +86,23 @@ includes in that file, or use libc++ 23 or libstdc++.
 | `maxRedirects` | 10 | 0 disables redirect following |
 | `maxResponseBodyBytes` | 64 MiB | the most `send()` will hold in memory; does not bound `download_to_file` or `send_stream` |
 | `retryOnStaleConnection` | true | resend once when a pooled connection turns out to have been closed while idle |
+| `extraCaFile` | empty | path of a PEM file of CA certificates to trust in addition to the default store, see below |
 | `proxy` | none | proxy URL, see below |
+
+### Extra CA certificates
+
+A private CA, or a proxy that re-signs TLS, is not in the default store, and
+`SSL_CERT_FILE` replaces that store instead of adding to it. Set `extraCaFile`
+to a PEM file and its certificates are trusted as well as the default ones:
+
+```cpp
+cfg.extraCaFile = "/etc/corp/root-ca.pem";
+```
+
+It applies to the connection to an `https://` proxy as well as to the target. If
+the file cannot be read or holds no certificate, the connection fails and
+`statusText` names the file. The file adds to a default store and does not stand
+in for one: with none found, the connection fails as described under `verifySsl`.
 
 ### Proxies
 

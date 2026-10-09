@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+### TLS handshake time limit
+
 The TLS handshake is bounded by `connectTimeoutMs`. It had no limit: after the
 TCP connection was up, a server (or an https:// proxy) that accepted it and never
 sent its ServerHello held `send`, `send_stream` and `download_to_file` for good
@@ -22,6 +24,19 @@ unless the caller passed a stop token.
   default) for no limit; a call by name compiles unchanged, a pointer to it needs
   the new parameter in its type. `Socket` gains `set_deadline`, `deadline_hit`
   and `wait_before_recv`.
+
+### Extra CA certificates
+
+`HttpClientConfig::extraCaFile` is a path to a PEM file whose certificates are
+trusted in addition to the default store, which `SSL_CERT_FILE` can only replace.
+It is for a private CA or a proxy that re-signs TLS.
+
+* It applies wherever a trust store is built: the target, and the connection to
+  an `https://` proxy.
+* A file that cannot be read or holds no certificate fails the connection, and
+  `statusText` names the file.
+* `proxy_tunnel` takes the path as a trailing default argument, and `TlsSocket`
+  gains `set_extra_ca_file`. Nothing changes while the field is empty.
 
 ## 0.3.4
 

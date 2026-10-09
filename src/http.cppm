@@ -107,6 +107,13 @@ export struct HttpClientConfig {
     // endpoints, and restricting it there would make the retry inapplicable to
     // nearly every request it exists to rescue. Set false to opt out.
     bool retryOnStaleConnection { true };
+
+    // A PEM file of CA certificates to trust in addition to the default store
+    // (`SSL_CERT_FILE`, or else the system roots), for a private CA or a proxy that
+    // re-signs TLS. It applies to the connection to an https:// proxy as well.
+    // A file that cannot be read or holds no certificate fails the connection,
+    // with the path in `statusText`. Empty means none.
+    std::string extraCaFile;
 };
 
 // Progress callback for streaming downloads: (totalBytes, downloadedBytes)
@@ -1042,10 +1049,12 @@ private:
     // connection failed: a proxy that refused the tunnel says so in its own words.
     bool open_connection(TlsSocket& sock, const ParsedUrl& parsed, std::string& error,
                          std::stop_token stop) {
+        sock.set_extra_ca_file(config_.extraCaFile);
         if (config_.proxy.has_value()) {
             auto tunnel = proxy_tunnel(parse_proxy_url(config_.proxy.value()),
                                        parsed.host, parsed.port,
-                                       config_.connectTimeoutMs, config_.verifySsl, stop);
+                                       config_.connectTimeoutMs, config_.verifySsl, stop,
+                                       config_.extraCaFile);
             if (!tunnel.ok()) {
                 error = std::move(tunnel.error);
                 return false;

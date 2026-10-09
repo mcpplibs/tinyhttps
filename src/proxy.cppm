@@ -347,12 +347,13 @@ export struct ProxyTunnel {
     }
 };
 
-// `verifySsl` is for the connection to an https:// proxy, and is the same
-// setting that governs the connection to the target.
+// `verifySsl` and `extraCaFile` are for the connection to an https:// proxy, and
+// are the same settings that govern the connection to the target.
 export ProxyTunnel proxy_tunnel(const ProxyConfig& proxy,
                                 std::string_view targetHost, int targetPort,
                                 int timeoutMs, bool verifySsl = true,
-                                std::stop_token stop = {}) {
+                                std::stop_token stop = {},
+                                std::string_view extraCaFile = {}) {
     ProxyTunnel tunnel;
     tunnel.socket.set_stop(stop);
     const std::string where = proxy.host + ":" + std::to_string(proxy.port);
@@ -369,6 +370,7 @@ export ProxyTunnel proxy_tunnel(const ProxyConfig& proxy,
     } else if (proxy.scheme == "https") {
         auto tls = std::make_unique<TlsSocket>();
         tls->set_stop(stop);
+        tls->set_extra_ca_file(std::string(extraCaFile));
         if (!tls->connect(proxy.host.c_str(), proxy.port, timeoutMs, verifySsl)) {
             // The session says why when the TCP connection was up, which is
             // where a proxy certificate that does not verify is refused.

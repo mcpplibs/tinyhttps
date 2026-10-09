@@ -368,7 +368,7 @@ jobs:
       - name: The hermetic tests
         run: |
           set -o pipefail
-          for t in test_framing test_tls_verify test_pool test_proxy test_cancel test_handshake_timeout; do
+          for t in test_framing test_tls_verify test_pool test_proxy test_cancel test_handshake_timeout test_extra_ca; do
             mcpp test "$t" 2>&1 | tee "$t.log"
             grep -q "^$t \.\.\. ok" "$t.log"
           done
