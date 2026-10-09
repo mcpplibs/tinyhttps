@@ -16,6 +16,8 @@ unless the caller passed a stop token.
   now fails where it used to complete. Each step of setting up a connection (the
   TCP connect, a proxy's reply, a handshake) has `connectTimeoutMs` to itself, so
   the whole can take several times that.
+* `TlsSocket::connect` bounds the handshake with the `timeoutMs` it already
+  took for the TCP connect, so a caller of it directly sees the change too.
 * `TlsSocket::connect_over` takes a trailing `handshakeTimeoutMs`, `-1` (the
   default) for no limit; a call by name compiles unchanged, a pointer to it needs
   the new parameter in its type. `Socket` gains `set_deadline`, `deadline_hit`
